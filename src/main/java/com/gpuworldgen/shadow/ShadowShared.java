@@ -477,6 +477,26 @@ public final class ShadowShared {
             lastRegionCz = cz;
         }
 
+        /**
+         * v0.14.0: 超预算时只淘汰**当前区域之外**的柱。
+         * 旧版一超预算就 cols.clear()，工作集被整片丢弃——真机日志里缓存柱在 130/2913/3608/
+         * 4063 之间来回摆，命中率永远起不来。
+         */
+        public void evictOutside(int budgetCols) {
+            if (cols.size() <= budgetCols) return;
+            int x0 = rQx0, z0 = rQz0, w = rW, h = rH;
+            boolean act = regionActive;
+            for (Long k : cols.keySet()) {
+                if (act) {
+                    int qx = (int) (k >> 32);
+                    int qz = (int) (long) k;
+                    if (qx >= x0 && qx < x0 + w && qz >= z0 && qz < z0 + h) continue;
+                }
+                cols.remove(k);
+                if (cols.size() <= budgetCols) return;
+            }
+        }
+
         public int maxColumns(int budgetMb) {
             long bytes = (long) budgetMb * 1024L * 1024L;
             int cap = (int) Math.max(1024, bytes / Math.max(1, (long) layers * 4L));

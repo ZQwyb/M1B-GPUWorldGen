@@ -50,7 +50,7 @@ public final class ModConfig {
     // ---------- v0.11.0 GPU 接管（格点学习 + 区域预取）参数 ----------
 
     /** 最多接管几个 3D 噪声实例（每个实例独立缓存在显存/内存外，按格点学习结果决定） */
-    public int maxServedInstances = 4;
+    public int maxServedInstances = 6;
 
     /** 每 tick 最多跑几个预取批次（每批 = 一次 draw + 一次回读，约 2-4ms） */
     public int prefetchPassesPerTick = 6;
@@ -62,13 +62,13 @@ public final class ModConfig {
     public int prefetchPointsPerPass = 2048;
 
     /** 每 tick 最多花多少毫秒在区域预取上（控制帧耗时，超了就留到下个 tick） */
-    public double prefetchBudgetMs = 3.0;
+    public double prefetchBudgetMs = 4.0;
 
     /** 命中判定容差（格点索引空间，无量纲）：|坐标/步长 - 最近整数| 必须小于它才服务 */
     public double serveTolerance = 1e-6;
 
     /** 列缓存内存预算（MB，超限清空重来） */
-    public int cacheBudgetMb = 24;
+    public int cacheBudgetMb = 48;
 
     /** 进世界后延迟多少 tick 再跑开机自检（让世界生成的预取先跑起来，避免自检抢占渲染线程） */
     public int verifyDelayTicks = 40;

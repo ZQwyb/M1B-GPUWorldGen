@@ -545,6 +545,10 @@ public final class GlComputeRunner {
     private int size = 128;
     /** 前若干批打印明细（排查格点/覆盖是否合理） */
     private int debugBatches = 4;
+    private int debugEvict = 4;
+    /** v0.14.0: 统计用——累计算出的噪声值个数（用于算 GPU 吞吐 ns/值） */
+    private long serviceValues;
+    private long lastHit, lastCalls, lastNanos, lastValues;
 
     // v0.6.9: 渲染前保存/恢复游戏全套 GL 状态（此前 v0.6.8 只恢复帧缓冲+viewport，
     // 纹理绑定/程序/VAO 泄漏导致 FFM 直连绕过 MC RenderSystem 缓存 → 主菜单 GUI 文字花屏）
@@ -668,8 +672,10 @@ public final class GlComputeRunner {
 
     private void onTick(net.minecraft.client.Minecraft client) {
         try {
-            // 主菜单 / splash 完全不碰 GL（v0.8.5 教训：主菜单验证会导致 GUI 文字花屏）
-            if (!client.isGameLoadFinished() || client.player == null) return;
+            // v0.14.0: 世界生成爆发发生在「已进入世界、加载遮罩还没消失」的阶段（真机日志：join 后
+            // 1 秒内 83 万次调用），旧门禁 isGameLoadFinished() 让预取整整晚了 8 秒才启动。
+            // 主菜单里 level==null，仍然完全不碰 GL（v0.8.5 教训：主菜单编译 shader 会让 GUI 花屏）。
+            if (client.level == null || client.player == null) return;
             tickCount++;
             if (!initDone) {
                 initResources();
@@ -698,6 +704,8 @@ public final class GlComputeRunner {
 
     /** v0.11.0: 自检拆成每 tick 一轮；延迟 verifyDelayTicks 让预取先铺缓存。 */
     private void runVerifyStep() {
+        // 自检要编译 shader + 大量读回，只在加载完成后的稳定界面做（避免加载遮罩期间 GUI 花屏）
+        if (!net.minecraft.client.Minecraft.getInstance().isGameLoadFinished()) return;
         if (verifyStartTick < 0) {
             verifyStartTick = tickCount;
             verifyT0 = System.nanoTime();
@@ -921,15 +929,20 @@ public final class GlComputeRunner {
 
         int layers = Math.max(1, inst.layers);
         int ySlices = (layers + size - 1) / size;
+        int budgetCols = inst.maxColumns(Math.max(8,
+                cfg.cacheBudgetMb / Math.max(1, ShadowShared.servedCount())));
 
         if (inst.bCount <= 0) {
             if (!inst.regionActive) {
                 if (!inst.regionNeeded()) return false;
-                inst.beginRegion(REGION_RADIUS);
+                // v0.14.0: 区域宽度按缓存预算反推。旧版固定 13×13，128 宽的纹理一次只塞 13 列，
+                // 剩下的 115 列全是白算的像素——这是「均 0.4 柱/片」的直接原因。
+                int radius = Math.max(6, Math.min(64, (int) (Math.sqrt((double) budgetCols) / 2.0)));
+                inst.beginRegion(radius);
                 System.out.println(String.format(
-                        "[GPUWorldGen][接管] 实例#%d 区域预取开始：锚点=(%d,%d) 半径=%d → %dx%d 柱 x %d 层（%d 片/批）",
-                        inst.id, inst.anchorQx, inst.anchorQz, REGION_RADIUS,
-                        inst.rW, inst.rH, layers, ySlices));
+                        "[GPUWorldGen][接管] 实例#%d 区域预取开始：锚点=(%d,%d) 半径=%d → %dx%d 柱 x %d 层（%d 片/批，预算 %d 柱）",
+                        inst.id, inst.anchorQx, inst.anchorQz, radius,
+                        inst.rW, inst.rH, layers, ySlices, budgetCols));
             }
             if (inst.rRow >= inst.rH) { inst.regionActive = false; return false; }
             int count = Math.min(size, inst.rW - inst.rCol);
@@ -963,13 +976,16 @@ public final class GlComputeRunner {
         float[] vals = inst.batchVals;
         int qz = inst.bQz;
         double wz = inst.bz + (double) qz * inst.dz;
-        int budgetCols = inst.maxColumns(Math.max(8,
-                cfg.cacheBudgetMb / Math.max(1, ShadowShared.servedCount())));
         int cached = inst.cols.size();
         if (cached > budgetCols) {
-            inst.cols.clear();
-            System.out.println("[GPUWorldGen][接管] 实例#" + inst.id + " 缓存超预算（"
-                    + cached + " 柱 > " + budgetCols + "），清空重建");
+            // v0.14.0: 旧版一超预算就 cols.clear()，工作集被整片丢弃（日志里缓存柱在 130/2913/3608
+            // 之间来回摆），命中率永远起不来。现在只淘汰当前区域外的柱。
+            inst.evictOutside(budgetCols);
+            if (debugEvict > 0) {
+                debugEvict--;
+                System.out.println("[GPUWorldGen][接管] 实例#" + inst.id + " 缓存超预算（"
+                        + cached + " 柱 > " + budgetCols + "），已淘汰区域外柱 → 剩 " + inst.cols.size());
+            }
         }
 
         CpuMcPerlin cpu = new CpuMcPerlin(inst.perms, inst.ox, inst.oy, inst.oz);
@@ -1062,6 +1078,7 @@ public final class GlComputeRunner {
             invoke(glBindFramebuffer, GL_FRAMEBUFFER, 0);
         }
         if (px == null) return false;
+        serviceValues += (long) count * yn;
         for (int yl = 0; yl < yn; yl++) {
             int rowBase = yl * count;
             int dst = yBase + yl;
@@ -1089,7 +1106,7 @@ public final class GlComputeRunner {
     }
 
 
-    /** v0.11.0: 接管统计行（每 40 tick 一次 + 自检结束时一次）。 */
+    /** v0.14.0: 接管统计行（每 40 tick 一次 + 自检结束时一次），新增「最近区间」与「GPU 吞吐」。 */
     private void printStats(boolean force) {
         long hit = ShadowShared.totalHits();
         long miss = ShadowShared.totalMisses();
@@ -1097,16 +1114,26 @@ public final class GlComputeRunner {
         double rate = calls > 0 ? 100.0 * hit / calls : 0.0;
         int reg = ShadowShared.registered();
         int served = ShadowShared.servedCount();
+        long ivHit = hit - lastHit, ivCalls = calls - lastCalls;
+        long ivNanos = serviceNanos - lastNanos, ivValues = serviceValues - lastValues;
+        lastHit = hit; lastCalls = calls; lastNanos = serviceNanos; lastValues = serviceValues;
         System.out.println(String.format(
-                "[GPUWorldGen] GPU 接管 v0.13: 提供噪声 %.2f%% (%d hit / %d 调用, 格点外 %d)"
+                "[GPUWorldGen] GPU 接管 v0.14: 提供噪声 %.2f%% (%d hit / %d 调用, 格点外 %d)"
                         + " | 实例 %d 注册 / %d 可服务 | 缓存柱=%d | 预取 %d 批 / 失败 %d 批",
                 rate, hit, calls, ShadowShared.offLattice.get(), reg, served,
                 ShadowShared.totalColumns(), servicePasses, ShadowShared.totalFailPasses()));
-        if (servicePasses > 0) {
+        if (ivCalls > 0) {
             System.out.println(String.format(
-                    "[GPUWorldGen] 区域预取耗时: 均 %.2f ms/片 (draw+read+抽检), 均 %.1f 柱/片",
+                    "[GPUWorldGen] 最近区间: 命中 %d / 调用 %d = %.2f%% | 本区间算出 %.0f k 值，耗时 %.0f ms",
+                    ivHit, ivCalls, 100.0 * ivHit / ivCalls, ivValues / 1000.0, ivNanos / 1e6));
+        }
+        if (servicePasses > 0) {
+            double nsPerValue = ivValues > 0 ? (double) ivNanos / ivValues : 0;
+            System.out.println(String.format(
+                    "[GPUWorldGen] 区域预取耗时: 均 %.2f ms/片 (draw+read+抽检), 均 %.1f 柱/片,"
+                            + " GPU 吞吐 %.0f ns/值 (CPU 单次 get 实测约 67 ns)",
                     (double) serviceNanos / servicePasses / 1e6,
-                    (double) ShadowShared.totalColumns() / servicePasses));
+                    (double) ShadowShared.totalColumns() / servicePasses, nsPerValue));
         }
         for (int i = 1; i <= 32; i++) {
             ShadowShared.Instance inst = ShadowShared.get(i);
