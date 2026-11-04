@@ -978,17 +978,17 @@ public final class GlComputeRunner {
                 // v0.15.0: 层数不能按 128 截断（真实 y 跨度常达数百层），由 slabs 逐片算完
                 // 层数同样拉满（用满 y 窗口），不按模式裁剪 —— 裁剪只会抬高每值成本
                 int totalY = Math.max(1, inst.bYCount);
-                int yLayers = Math.min(layers - inst.bYBase, totalY);
-                if (yLayers <= 0) yLayers = Math.min(totalY, layers);
-                yLayers = Math.min(layers, Math.max(yLayers, size));
+                // v0.15.2: 先把 yLayers 定稿（含 yBase 夹取），再分配缓冲 ——
+                // 顺序反了就会出现「按 A 分配、按 B 写」的越界。
+                int yBaseAbs = Math.max(0, Math.min(inst.bYBase, layers - 1));
+                int yLayers = Math.min(layers - yBaseAbs, Math.max(totalY, size));
+                if (yLayers <= 0) yLayers = 1;
                 float[] buf = inst.batchVals;
                 if (buf == null || buf.length != count * yLayers) buf = new float[count * yLayers];
                 inst.batchVals = buf;
                 inst.bCount = count;
                 inst.bQx0 = qxMin;
                 inst.bQz = qz;
-                int yBaseAbs = Math.max(0, Math.min(inst.bYBase, layers - 1));
-                yLayers = Math.min(yLayers, layers - yBaseAbs);
                 inst.bSlab = 0;
                 inst.bSlabs = Math.max(1, (yLayers + size - 1) / size);
                 // 用专属字段记录本批 y 基，交给 runSlab
@@ -998,6 +998,7 @@ public final class GlComputeRunner {
                 inst.bRows = null;
                 if (inst.rRow >= inst.rH) { inst.regionActive = false; return false; }
                 int count = Math.min(size, inst.rW - inst.rCol);
+                // 矩形分支：整窗分 ySlices 片，每秒层的步长恒为 layers（与分配一致）
                 float[] buf = inst.batchVals;
                 if (buf == null || buf.length != count * layers) buf = new float[count * layers];
                 inst.batchVals = buf;
@@ -1007,7 +1008,7 @@ public final class GlComputeRunner {
                 inst.bSlab = 0;
                 inst.bSlabs = ySlices;
                 inst.bYBase0 = 0;
-                inst.bYLayers = Math.min(size, layers);
+                inst.bYLayers = layers;
             }
         }
 
@@ -1020,7 +1021,8 @@ public final class GlComputeRunner {
         double baseZ = inst.bz + (double) inst.bQz * inst.dz;
 
         long t0 = System.nanoTime();
-        boolean ok = runSlab(inst, baseX, baseZ, count, yBase, yn, inst.batchVals, layers);
+        boolean ok = runSlab(inst, baseX, baseZ, count, yBase, yn, inst.batchVals,
+                Math.max(1, inst.bYLayers));
         serviceNanos += System.nanoTime() - t0;
         if (!ok) { inst.bCount = 0; return false; }
         servicePasses++;
@@ -1120,7 +1122,7 @@ public final class GlComputeRunner {
      * 值写入 out[c*layers + yBase + yl]。
      */
     private boolean runSlab(ShadowShared.Instance inst, double baseX, double baseZ,
-                            int count, int yBase, int yn, float[] out, int layers) {
+                            int count, int yBase, int yn, float[] out, int stride) {
         invoke(glUseProgram, shadowProg);
         invoke(glBindVertexArray, vao);
 
@@ -1152,6 +1154,12 @@ public final class GlComputeRunner {
             invoke(glBindFramebuffer, GL_FRAMEBUFFER, 0);
         }
         if (px == null) return false;
+        // v0.15.2: 硬性边界检查 —— 分配不足时必须抛出来，绝不能越界写（真机上表现为 native SIGSEGV）
+        if (count <= 0 || yn <= 0 || stride < 1 || out.length < count * stride) {
+            throw new IllegalStateException(String.format(
+                    "预取缓冲越界: count=%d yn=%d stride=%d alloc=%d 需要=%d",
+                    count, yn, stride, out.length, count * stride));
+        }
         serviceValues += (long) count * yn;
         for (int yl = 0; yl < yn; yl++) {
             int rowBase = yl * count;
@@ -1159,7 +1167,9 @@ public final class GlComputeRunner {
             for (int c = 0; c < count; c++) {
                 int idx = (rowBase + c) * 4;
                 // 真实值 = hi + lo（dd 两段合成），以 double 相加再收成 float，避免二次舍入
-                out[c * layers + dst] = (float) ((double) px[idx] + (double) px[idx + 1]);
+                // v0.15.2: 步长必须是本批分配的行数（stride），不是全局 layers ——
+                // 用 layers 写进只有 count*yLayers 的缓冲区 = 越界写，会以 SIGSEGV 崩溃。
+                out[c * stride + dst] = (float) ((double) px[idx] + (double) px[idx + 1]);
             }
         }
         return true;
