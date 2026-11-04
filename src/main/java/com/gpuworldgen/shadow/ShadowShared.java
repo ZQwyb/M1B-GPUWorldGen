@@ -147,6 +147,23 @@ public final class ShadowShared {
         public volatile boolean regionActive;
         public volatile int rQx0, rQz0, rW, rH, rRow, rCol;
         public volatile long passes, columns, failPasses;
+        // ---------- 当前批次（一次 128 列 x 128 层，跨 tick 分 y 片推进） ----------
+        public volatile float[] batchVals;
+        public volatile int bCount, bQx0, bQz, bSlab, bSlabs;
+
+        // ---------- 诊断：相邻调用差分（判断真实采样格点/遍历顺序） ----------
+        private double prevX, prevY, prevZ;
+        private boolean hasPrev;
+        public final double[] dX = new double[24], dY = new double[24], dZ = new double[24];
+        public volatile int dN;
+        /** 学习重试次数（采样窗太早推不出步长时换窗再试） */
+        private int learnTries;
+        /** 命中窗口外（但落在格点上）的 qy 需求范围，用于按需扩容 */
+        public volatile int needQyMin = Integer.MAX_VALUE, needQyMax = Integer.MIN_VALUE;
+        /** 已观察到的最大 y 层索引（决定预取窗口要多大） */
+        public volatile int maxQySeen = -1;
+        /** y 窗口扩容次数 */
+        public volatile int growCount;
         /** 连续整批抽检失败次数（连续 3 次才永久降级） */
         public int failStreak;
         public volatile int anchorQx, anchorQz;
@@ -204,8 +221,18 @@ public final class ShadowShared {
             double ty = (y - by) * iy;
             long qy = Math.round(ty);
             int n = layers;
-            if (Math.abs(ty - (double) qy) > tol || qy < 0 || qy >= n) {
+            if (Math.abs(ty - (double) qy) > tol) {
                 oob++;
+                return Float.NaN;
+            }
+            if (qy >= 0 && qy < n) {
+                if ((int) qy > maxQySeen) maxQySeen = (int) qy;
+            } else {
+                // 落在格点上但超出当前 y 窗口：记下真实需求范围，渲染线程按需扩容
+                oob++;
+                int iq = (int) qy;
+                if (iq < needQyMin) needQyMin = iq;
+                if (iq > needQyMax) needQyMax = iq;
                 return Float.NaN;
             }
             float[] col = cols.get(ShadowShared.keyOf((int) qx, (int) qz));
@@ -227,6 +254,14 @@ public final class ShadowShared {
         private synchronized void observe(double x, double y, double z) {
             if (learned) return;
             long c = ++obsCalls;
+            // 诊断：记录前 24 个相邻调用差分（看出真实遍历顺序与步长）
+            if (hasPrev && dN < 24) {
+                dX[dN] = x - prevX;
+                dY[dN] = y - prevY;
+                dZ[dN] = z - prevZ;
+                dN++;
+            }
+            prevX = x; prevY = y; prevZ = z; hasPrev = true;
             if (x < minX) minX = x;
             if (x > maxX) maxX = x;
             if (y < minY) minY = y;
@@ -268,10 +303,22 @@ public final class ShadowShared {
             double stepY = flat ? 1.0 : strideOf(svY, nY, minY, maxY);
             double stepZ = strideOf(svZ, nZ, minZ, maxZ);
             if (!(stepX > 0) || !(stepY > 0) || !(stepZ > 0)) {
+                // v0.13.0: 采样窗太早/坐标维度单一（例如只沿一列采样）时步长推不出来，
+                // 不要一次就判死——换一个采样窗再试，最多 4 次；真推不出来才永久 fallback。
+                if (learnTries < 4) {
+                    learnTries++;
+                    obsCalls = 0;
+                    nX = nY = nZ = 0;
+                    minX = minY = minZ = Double.MAX_VALUE;
+                    maxX = maxY = maxZ = -Double.MAX_VALUE;
+                    hasPrev = false;
+                    dN = 0;
+                    return;
+                }
                 learned = true;
                 ok = false;
-                learnNote = String.format("格点步长无法确定（x=%s y=%s z=%s）",
-                        fmt(stepX), fmt(stepY), fmt(stepZ));
+                learnNote = String.format("格点步长无法确定（x=%s y=%s z=%s，已重采样 %d 次）",
+                        fmt(stepX), fmt(stepY), fmt(stepZ), learnTries);
                 logLearn();
                 return;
             }
@@ -325,9 +372,64 @@ public final class ShadowShared {
                     "[GPUWorldGen][接管] 实例#%d 格点学习: x[起点=%s 步长=%s] y[起点=%s 步长=%s 层=%d] z[起点=%s 步长=%s] → %s",
                     id, fmt(bx), fmt(dx), fmt(by), fmt(dy), layers, fmt(bz), fmt(dz),
                     ok ? "可服务（开始区域预取）" : learnNote));
-            if (ok) System.out.println(String.format(
-                    "[GPUWorldGen][接管] 实例#%d 期望 y 覆盖 [%s .. %s]（观测到 %d 层，超出则 CPU fallback）",
-                    id, fmt(by), fmt(by + (layers - 1) * dy), layers));
+            if (ok) {
+                System.out.println(String.format(
+                        "[GPUWorldGen][接管] 实例#%d 期望 y 覆盖 [%s .. %s]（观测到 %d 层，超出则按需扩容）",
+                        id, fmt(by), fmt(by + (layers - 1) * dy), layers));
+                if (dN > 0) {
+                    StringBuilder sb = new StringBuilder();
+                    for (int i = 0; i < Math.min(8, dN); i++) {
+                        sb.append(String.format(" (%s,%s,%s)", fmt(dX[i]), fmt(dY[i]), fmt(dZ[i])));
+                    }
+                    System.out.println("[GPUWorldGen][接管] 实例#" + id + " 相邻调用差分样本:" + sb);
+                }
+            }
+        }
+
+        /**
+         * 渲染线程调用：按真实需求调整 y 窗口（扩容会清空柱缓存，格点相位不变）。
+         * @return 是否发生了扩容
+         */
+        public boolean maybeGrow() {
+            int lo = needQyMin, hi = needQyMax;
+            if (lo == Integer.MAX_VALUE || hi == Integer.MIN_VALUE) return false;
+            int n = layers;
+            if (lo >= 0 && hi < n) return false;
+            if (growCount >= 6 || !ok) return false;
+            int newLo = Math.min(0, lo);
+            int newHi = Math.max(n - 1, hi);
+            int margin = Math.max(8, (newHi - newLo + 1) / 8);
+            newHi += margin;
+            int newN = newHi - newLo + 1;
+            if (newN > 8192) return false;
+            double newBy = by + (double) newLo * dy;
+            // 先清缓存再改元数据：并发 lookup 要么看到「旧元数据+空缓存」(NaN)，不会越界
+            synchronized (LOCK) {
+                cols.clear();
+                batchVals = null;
+                bCount = 0;
+                bSlab = 0;
+                regionActive = false;
+                anchorValid = false;
+                lastRegionCx = Integer.MIN_VALUE;
+                needQyMin = Integer.MAX_VALUE;
+                needQyMax = Integer.MIN_VALUE;
+                by = newBy;
+                layers = newN;
+                growCount++;
+            }
+            System.out.println(String.format(
+                    "[GPUWorldGen][接管] 实例#%d y 窗口扩容: %d 层 → %d 层（y=[%s .. %s]），旧缓存已清空",
+                    id, n, newN, fmt(newBy), fmt(newBy + (double) (newN - 1) * dy)));
+            return true;
+        }
+
+        /** 统计行里的附加诊断。 */
+        public String diagExtra() {
+            return String.format(" maxQy=%d 扩容=%d 需求y=[%s..%s]",
+                    maxQySeen, growCount,
+                    needQyMin == Integer.MAX_VALUE ? "-" : String.valueOf(needQyMin),
+                    needQyMax == Integer.MIN_VALUE ? "-" : String.valueOf(needQyMax));
         }
 
         /** 降级为永久 CPU fallback，并释放占用的接管槽位（失败实例不该长期占坑）。 */

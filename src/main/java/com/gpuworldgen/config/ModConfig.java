@@ -50,7 +50,7 @@ public final class ModConfig {
     // ---------- v0.11.0 GPU 接管（格点学习 + 区域预取）参数 ----------
 
     /** 最多接管几个 3D 噪声实例（每个实例独立缓存在显存/内存外，按格点学习结果决定） */
-    public int maxServedInstances = 2;
+    public int maxServedInstances = 4;
 
     /** 每 tick 最多跑几个预取批次（每批 = 一次 draw + 一次回读，约 2-4ms） */
     public int prefetchPassesPerTick = 6;
