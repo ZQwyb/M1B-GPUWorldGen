@@ -316,6 +316,44 @@ MobileGlues 不校验句柄有效性，往已释放的原生对象写 uniform �
 若仍然崩，把 `config/gpuworldgen.json` 的 `gpuTakeover` 改成 `false` 可立即回到
 纯 CPU 模式（一定能玩），并把游戏目录下的 `hs_err_pid*.log` 发我 —— 那个文件才有 native 栈。
 
+## v0.16.0 · B 路线第一阶段（探针，零风险）
+
+### 目标
+
+放弃「逐点 get 缓存」（已证明结构上赢不了 CPU 的 67ns/值，且命中率 0），改走
+**mixin 接管 `PerlinNoise.addToVolume`** —— MC 26.3 的批量噪声入口，一次带一整个
+`DensityVolume`（一个区块 × 全高）。
+
+### 本版只做「探针」：只观察、不改任何行为
+
+新增 `PerlinNoiseVolumeProbeMixin`，挂在 `addToVolume` 的 HEAD，只记录：
+- 单块形状：`sizeX×sizeY×sizeZ` 与 step（决定 GPU 一次 draw 能铺多少、格点数）
+- 块坐标范围（minBlockX/Y/Z）
+- `xzScale / yScale / amplitude`
+- **调用线程**（世界生成在 Server/Worker 线程，而 GL 上下文只在渲染线程 —— 这决定
+  GPU 结果能不能「同步」回传，是最关键的一个数）
+
+不做任何 GPU 操作、不 cancel、不改 buffer → 零风险，一定不崩。
+
+### 进游戏后看这几行（决定 B 怎么实现）
+
+```
+[GPUWorldGen][B探针] addToVolume 首次: dim=16x384x16 step=1/1/1 cells=98304 blockBase=(...)
+[GPUWorldGen][B探针]   首次 scales: xzScale=... yScale=... amplitude=...
+[GPUWorldGen][B探针]   调用线程: Server thread (isRender=false/true)
+[GPUWorldGen][B探针] 新形状#N: ...
+[GPUWorldGen][B探针] 累计 4096 块 / NNN 格子，均 NN 格子/块
+```
+
+把这几行发我即可。我据此决定：
+1. 单块若 ~98304 格子（16×384×16），一次 draw 打满后每值成本可摊到 67ns 以下 → GPU 能赢；
+2. 调用线程若必在 Server thread 且需同步结果 → 必须做「跨线程阻塞等渲染帧」通道（一次 16ms），
+   这决定了 B 的真实上限，我要先确认它值不值。
+
+### 约定
+
+本版**仍是纯 CPU 世界生成**（预取 probe 之外不接管任何值），与 v0.15.4 一样稳定。
+
 ## 后续计划
 
 - v0.16+：PBO 异步回读（消除每片 glFinish 串行停顿）；按实例查询热度动态调整预算；多线程预取（渲染线程外做回读 CPU 侧比对）；批量接管 `addToVolume` 体素路径

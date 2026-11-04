@@ -3,7 +3,8 @@
   "package": "com.gpuworldgen.mixin",
   "compatibilityLevel": "JAVA_17",
   "client": [
-    "PerlinNoiseShadowMixin"
+    "PerlinNoiseShadowMixin",
+    "PerlinNoiseVolumeProbeMixin"
   ],
   "injectors": {
     "defaultRequire": 0
