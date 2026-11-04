@@ -684,6 +684,14 @@ public final class GlComputeRunner {
             }
             if (initError != null) { if (done != null) release(); return; }
 
+            // ---- v0.15.3: 预取与自检必须串行，绝不能在同一 tick 内互相篡改 GL 状态 ----
+            // 崩溃日志里 saveState 被连续刷屏，正是两者在同一帧反复存取状态所致。
+            if (done != null) {
+                // 自检进行中：本 tick 只做自检，不做预取
+                runVerifyStep();
+                return;
+            }
+
             // ---- v0.11.0 第一优先：区域预取 ----
             // 区块初次生成是「毫秒级一次性爆发」（真机日志：8 秒 83 万次查询），缓存必须在它
             // 之前/同时就位；旧的异步按区块补丁永远追不上，这是 0.0% 命中的根因。
@@ -693,8 +701,7 @@ public final class GlComputeRunner {
                 if (serviceErrors++ < 5) System.out.println("[GPUWorldGen] 区域预取异常: " + st);
             }
 
-            // ---- 第二优先：稳定性自检（每 tick 最多一轮，不再整帧阻塞） ----
-            if (done != null) runVerifyStep();
+            // 自检已在上面串行处理
         } catch (Throwable t) {
             initError = t.toString();
             report.append("    [GL] tick 异常: ").append(t).append('\n');
@@ -879,7 +886,13 @@ public final class GlComputeRunner {
      * 每 tick 调一次：给每个可服务实例推进若干批区域预取。
      * 没有可服务实例时退回 v0.8.0 的 2D 影子比对（有限次）。
      */
+    /** 预取熔断：连续异常达到阈值后永久停用预取，保证游戏可玩（宁可 0% 命中也不要崩）。 */
+    private int takeoverFailures;
+    private boolean takeoverDisabled;
+
     private void serviceTakeover() {
+        if (takeoverDisabled) return;
+        if (!cfg.gpuTakeover) return;   // v0.15.3: 默认关闭，见 ModConfig.gpuTakeover 注释
         if (!ShadowShared.anyServable()) {
             try { shadowTickOnce(); } catch (Throwable ignored) {}
             return;
@@ -901,11 +914,25 @@ public final class GlComputeRunner {
             for (int i = 0; i < budget; i++) {
                 boolean any = false;
                 for (ShadowShared.Instance inst : ShadowShared.servable()) {
-                    if (runOnePass(inst)) any = true;
+                    try {
+                        if (runOnePass(inst)) any = true;
+                    } catch (Throwable passErr) {
+                        // v0.15.3: 单个实例的预取出错必须只降级它自己，绝不能让异常/越界传到游戏层
+                        inst.disable("预取异常: " + passErr);
+                        if (serviceErrors++ < 8) System.out.println("[GPUWorldGen] 预取异常(实例#" + inst.id + "): " + passErr);
+                    }
                     // 帧时间硬预算——预取再急也不能把渲染线程拖崩
                     if (System.nanoTime() - t0 > limit) return;
                 }
                 if (!any) break;
+            }
+        } catch (Throwable fatal) {
+            takeoverFailures++;
+            System.out.println("[GPUWorldGen] 预取致命异常 #" + takeoverFailures + ": " + fatal);
+            if (takeoverFailures >= 3) {
+                takeoverDisabled = true;
+                System.out.println("[GPUWorldGen] 预取已熔断停用（连续 " + takeoverFailures
+                        + " 次异常），改为纯 CPU 世界生成。请把日志发给作者。");
             }
         } finally {
             restoreState();

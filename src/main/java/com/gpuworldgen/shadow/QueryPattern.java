@@ -105,9 +105,11 @@ public final class QueryPattern {
     /** 只取 (qx,qz) 列集合（去重），y 用整段范围 —— 供列式预取使用。 */
     public int[] replayColumns(int newBaseX, int newBaseZ) {
         if (!usable()) return null;
-        int[] tmp = new int[n];      // qx,qz 交错
+        // v0.15.3: 每个点写 2 个 int（qx,qz），必须按 2n 分配 —— 原写法 new int[n] 会在尾部越界写
+        int[] tmp = new int[n * 2];
         int m = 0;
-        for (int i = 0; i < n && m < n; i++) {
+        for (int i = 0; i < n; i++) {
+            if (m + 2 > tmp.length) break;
             int qx = newBaseX + offX[i];
             int qz = newBaseZ + offZ[i];
             boolean dup = false;

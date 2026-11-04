@@ -14,7 +14,7 @@ public class GpuWorldGenClient implements ClientModInitializer {
 
     @Override
     public void onInitializeClient() {
-        System.out.println("[GPUWorldGen] mod 加载 v0.15.2 (M1B-GPUWorldGen, GPU接管: 修复预取缓冲越界崩溃)");
+        System.out.println("[GPUWorldGen] mod 加载 v0.15.3 (M1B-GPUWorldGen, GPU接管默认关闭以规避 native 崩溃)");
         ModConfig config = ModConfig.load();
         if (!config.enabled) {
             System.out.println("[GPUWorldGen] 已禁用（config/gpuworldgen.json 中 enabled=false）。");

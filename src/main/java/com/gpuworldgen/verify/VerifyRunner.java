@@ -52,7 +52,7 @@ public final class VerifyRunner {
     }
 
     private void runInternal() throws Exception {
-        line("M1B-GPUWorldGen v0.15.2 — 多轮稳定性验证报告（验证在主菜单后跑，加载画面不污染）");
+        line("M1B-GPUWorldGen v0.15.3 — 多轮稳定性验证报告（验证在主菜单后跑，加载画面不污染）");
         line("==================================================");
         line("MC 版本目标: 26.3 (Fabric, Java 25)");
         line("采样配置: seed=" + config.seed + " size=" + config.size + "x" + config.size
