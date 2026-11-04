@@ -124,6 +124,16 @@ export LANG=C.utf8 LC_ALL=C.utf8     # 中文项目路径下必须，否则 Grad
 - 远期：Vulkan 后端支持（接口已预留）
 - 后面版本计划26.x
 
+## 交付位置（约定）
+
+每次构建出新版模组本体后，除保留 `build/libs/` 外，还要复制到手机共享存储：
+
+`/storage/emulated/0/M1B-GPUWorldGen项目/<jar 名>`
+
+可用通道（直接从容器写该目录会被系统拒绝 EPERM）：
+`/app/export?path=…` 先落到 `Download/DSHA/`，再用 `adb-shell cp` 移入目标目录，
+最后 `adb-shell sha256sum` 与本地校验和逐字节核对。
+
 ## 协议
 
 <div align="center">Mod 采用 MIT 协议</div>
