@@ -1,20 +1,22 @@
 ---
-name: Feature request
-about: Suggest an idea for this project
-title: ''
-labels: ''
+name: 功能建议
+about: 新想法、性能优化方向、适配其他设备
+title: '[feature] '
+labels: enhancement
 assignees: ''
-
 ---
 
-**Is your feature request related to a problem? Please describe.**
-A clear and concise description of what the problem is. Ex. I'm always frustrated when [...]
+## 想解决什么问题
 
-**Describe the solution you'd like**
-A clear and concise description of what you want to happen.
+（例如：某机型上接管率恒为 0；希望支持某个渲染后端；希望降低帧时间开销）
 
-**Describe alternatives you've considered**
-A clear and concise description of any alternative solutions or features you've considered.
+## 建议方案
 
-**Additional context**
-Add any other context or screenshots about the feature request here.
+## 你认为的收益
+
+（例如：预计可覆盖多少比例的噪声调用、预计省多少 ms/tick）
+
+## 补充
+
+- 相关日志 / 数据（如有）
+- 是否愿意帮忙测试（本项目只在一台 HONOR AAK-AN00 上验证过，**其他机型的实测数据非常有价值**）

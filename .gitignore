@@ -14,3 +14,11 @@ Thumbs.db
 
 # 本地产物
 *.jar
+
+# 保留 Gradle wrapper（否则新克隆无法直接 ./gradlew build）
+!gradle/wrapper/gradle-wrapper.jar
+
+# 运行目录
+runs/
+logs/
+config/

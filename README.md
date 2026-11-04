@@ -1,381 +1,159 @@
 # M1B-GPUWorldGen
 
-为 **Minecraft Java 版（手机端）** 实现真正 GPU 加速世界生成的 Fabric 适配 mod。
+**在手机的 GPU 上跑 Minecraft Java 版的世界生成噪声。**
+面向没有 PC 的玩家（PojavLauncher / Zalith Launcher / MobileGlues），把 `PerlinNoise`
+的计算下沉到 Adreno GPU，并保证与原版 **逐点一致（误差 < 1e-6）**。
 
-面向无 PC 的手机玩家（Pojav / Zalith Launcher 等），把世界生成里的 PerlinNoise 噪声计算
-下沉到手机 GPU（Adreno）执行，并保证与 MC 原版噪声 **逐点一致（误差 < 1e-6）**。
-
-> 当前处于 **GPU 接管阶段**：v0.13.0 改为「格点学习 + 128 列满带宽批量预取 + 抽检门禁 + y 窗口按需扩容」——
-> 自动推断每个噪声实例的采样格点，只服务严格落在格点上的查询，其余走 CPU fallback。
-> 宁可不服务，也绝不返回错值。
+[![Minecraft](https://img.shields.io/badge/Minecraft-26.3-62B47A)](https://www.minecraft.net/)
+[![Fabric](https://img.shields.io/badge/Fabric%20Loader-0.20.1-DBB69B)](https://fabricmc.net/)
+[![Java](https://img.shields.io/badge/Java-25-E76F00)](https://adoptium.net/)
+[![License](https://img.shields.io/badge/License-MIT-blue)](LICENSE)
 
 ---
 
-## 能力与当前状态
+## 这是什么
 
-| 阶段 | 状态 | 结果 |
-|---|---|---|
-| GLES double-double 噪声管线（fragment shader + FBO） | ✅ 已交付 | 5 轮 STABLE，大坐标误差 ~1e-14 |
-| MC 精确噪声 GPU 复刻（PerlinNoise 3D 16 梯度） | ✅ 已交付 | maxErr 5.499e-07，0/16384（超大坐标 5e6） |
-| 影子模式（真实实例逐点比对） | ✅ 已验收 | 真实坐标 maxErr 3.43e-07，mismatch 0 |
-| double-double 坐标（>2e6 不再丢小数） | ✅ v0.9.0 | 拆分重建误差 1.9e-09，精度上限 2^24 |
-| GPU 接管世界生成（首个实例） | ✅ v0.10.1 | mixin cancel 真返回 GPU 值 + CPU fallback + 预生成抽检 |
-| 多实例接管 + 格点学习 | ✅ v0.11.0 | 每个 PerlinNoise 实例自动推断采样格点（起点/步长/层数） |
-| 区域批量预取（mode22） | ✅ v0.11.0 | 一次 draw 算一整列，只回读实际用到的子矩形，按 tick 限额 |
-| 抽检门禁 / 配置自修复 | ✅ v0.11.0 | 整批抽检失败=永久 CPU fallback；截断 JSON 自动备份重建 |
-| 满带宽批量预取（128 列/次 draw） | ✅ v0.13.0 | 纹理利用率 1.5% → 100%，同样帧预算下供给提升约 60 倍 |
-| y 窗口按需扩容 / 学习重采样 | ✅ v0.13.0 | 越界自动扩窗（清缓存重铺）；采样窗太早推不出步长时换窗重试（最多 4 次） |
-| 多实例槽位 | ✅ v0.13.0 | 默认 4 个实例可服务（`maxServedInstances`，1~6 可调） |
+手机端 MC Java 版没有桌面级的并行计算能力，世界生成（尤其是 3D 密度噪声）是进世界时最重的
+CPU 负载之一。本项目用 Java FFM 在游戏的 EGL 上下文里直接调用 GLES，用 **fragment shader +
+double-double 模拟双精度**复刻 MC 的 `PerlinNoise`，把噪声值从 GPU 取回来供世界生成使用。
+
+它不替换世界生成器、不改存档格式、不打包任何 Minecraft 代码——只是一个 **mixin 层面的
+噪声加速适配层**，失效时自动退回原版 CPU 路径。
+
+## 当前状态
+
+| 模块 | 状态 | 说明 |
+| --- | --- | --- |
+| GLES double-double 噪声管线 | ✅ 稳定 | 5 轮 STABLE，大坐标（5e6）误差 1.3e-14 |
+| MC 精确噪声复刻（3D 16 梯度） | ✅ 对齐 | 16384 点 maxErr 5.5e-7，0/16384 超 1e-6 |
+| 真实实例影子比对 | ✅ 验收 | 真实坐标 maxErr 3.4e-7，mismatch 0 |
+| GPU 接管 `PerlinNoise.get(DDD)F` | ✅ 可用 | 命中则 `setReturnValue + cancel`，未命中 CPU fallback |
+| 格点学习 + 区域批量预取 | ✅ 可用 | 自动推断实例采样格点，只服务严格落在格点上的查询 |
+| 点选/抽检门禁 | ✅ 可用 | 抽检与 CPU 精确参考不一致 → 该实例永久降级，绝不返回错值 |
+| **批量接管 `addToVolume`（B 路线）** | 🧪 探针阶段 | v0.16.0 只做观察，不改行为；数据回收中 |
+
+> **v0.16.0 是一个「探针版」**：它不改变任何世界生成行为，只在 `PerlinNoise.addToVolume`
+> 上记录形状/步长/线程信息，用于决定下一代批量接管是否可行。稳定性和 v0.15.4 相同。
+
+### 关于命中率：一句实话
+
+GPU 接管命中率在真机上**长期偏低**（历史最好 0.42%，多数时间接近 0）。这不是调参问题，
+而是架构问题，我已经用两版真机日志把它量化清楚了：
+
+- 每次 draw 的固定开销约 **0.9 ms**（MobileGlues 转发 + `glReadPixels` 回读），
+  每值边际成本约 **61 ns**；
+- 同一台手机的 CPU 单线程算同一函数只要 **67 ns/值**（实测 300 万次平均）。
+
+也就是说：**在当前 MobileGlues 的「FBO + 回读」模型下，GPU 算噪声并不比 CPU 快**；
+命中率低时反而更慢。真正要赢，必须走 MC 26.3 新增的 `addToVolume` 批量入口，
+把每次 draw 的固定开销摊薄到几万个格点上——这正是 v0.16.0 探针要验证的事。
+
+详细的推导过程见 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)。
 
 ## 技术路线
 
-- 用 Java **FFM（Foreign Function & Memory）** 直接 `dlopen` 手机上的 `libmobileglues.so`，
-  `bind` 导出 GLES 原生函数，在游戏现有 EGL context 内执行。
-- **不新建 Vulkan/GL 实例**、不引入额外 native 库，完全复用游戏渲染上下文。
-- fragment shader 用 **double-double（DD）模拟双精度** 逐像素计算 MC PerlinNoise，
-  经 RGBA32F FBO `glReadPixels` 回读，再与 CPU 端 MC 原算法逐点比对。
-- mixin 挂载真实 `PerlinNoise.get(DDD)F`，用**反射**提取父类字段（perms/offsetX/Y/Z），
-  每个实例在 `ShadowShared` 注册一次，之后只用 `Instance.offer(x,y,z)` 查缓存：命中则
-  `setReturnValue + cancel`（真正跳过 CPU），未命中走原方法。
+- **FFM 直接绑定 GLES**：`dlopen` 手机上的 `libmobileglues.so`，`bind` 导出函数，
+  在游戏已有的 EGL context 内执行；不新建 GL/Vulkan 实例，不引入额外 native 库。
+- **double-double 精度**：GLES 只有 float，shader 里用 `two_sum` / `two_prod` /
+  `dd_mul` / `dd_fade` / `dd_lerp` 组合出约 48 位有效精度，复刻 MC 的 `Mth.lerp3` +
+  `Mth.smoothstep` 流程，与 Java 的 `float` 结果逐点对齐。
+- **mixin + 反射**：挂 `PerlinNoise.get(DDD)F`，反射读取父类 `GradientNoise` 的
+  `perms` / `offsetX/Y/Z`（不依赖 refMap，避免混淆环境下崩），按实例注册、按格点服务。
+- **安全阀**：所有 GL 调用包在 `saveState` / `restoreState` 里；每批抽检；连续失败熔断；
+  任何异常都 `catch (Throwable)` 后回归 CPU。
 
-### v0.11.0 接管架构（为什么和 v0.10 不一样）
-
-v0.10.x 把「噪声查询坐标直接 floor 成整数柱号」当缓存键、异步预生成 16×16×384 整数柱补丁，
-真机实测命中率 **0.0%**（833600 次调用 / 0 hit）。原因是 MC 的 3D 噪声按**格点**采样：
-
-- 坐标 = 方块坐标 × `xzScale`/`yScale`（如 `cavity` 为 1.0/0.6667、base noise 为 0.25/0.125），
-  y 步长常常不是 1，柱键根本对不上；
-- 区块初次生成是**一次性爆发**（日志：8 秒 83 万次调用），异步补丁预生成永远追不上；
-- 旧 `pending` 队列超过 256 直接 `clear()`，丢掉全部请求。
-
-v0.11.0 改成三件事：
-
-1. **格点学习**：实例注册后先统计前 ~600 次真实查询，用「最小正差 + 全样本整数倍校验」推断
-   格点 `x = bx + qx·dx`、`y = by + qy·dy`、`z = bz + qz·dz` 与层数 `nY`；混合尺度（同一实例被
-   多个 scale 引用）推断失败即降级，不猜。y 恒定的 **2D 噪声**（MC 的 `get(DD)` 走
-   `get(wrap(x),0,wrap(z))`）按单层柱接管，步长记为 1、层数 1。
-2. **区域批量预取**：`mode22` 一次 draw 覆盖「多列 × 全部 y 层」，只回读实际用到的
-   `count × nY` 子矩形；矩形区域（默认目标 48 批）以最近一次 miss 的格点为锚点铺开，
-   每 tick 限额若干批，稳定后可覆盖上千柱。offset 折进 Java 侧的 double 基坐标再拆 dd，
-   与 MC 的 double offset 完全一致。
-3. **抽检门禁**：每批回读后逐柱抽首/中/尾三层与 CPU 的 MC 精确参考比对（<1e-5），
-   通过的柱才写入缓存；整批全失败 → 该实例永久 CPU fallback 并释放槽位。
-
-> 因此接管率是**真实可测**的：`[GPUWorldGen] GPU 接管 v0.11: 提供噪声 XX%` 直接反映
-> 有多少次噪声查询由 GPU 提供。格点外查询（分数坐标、混合尺度）一律 CPU，绝不返回错值。
-
-**已判死路线（勿重复尝试）**：OpenCL（Android linker namespace 拦截，需 root）、
-Vulkan 第二实例（必崩）、LWJGL desktop compute（stub）、LWJGL GLES15 包（classpath 不存在）、
-FFM SSBO（索引全 -1）。
+**已判死的路线（别重复踩）**：OpenCL（Android linker namespace 拦截）、Vulkan 第二实例（必崩）、
+桌面 compute（stub）、SSBO（MobileGlues 索引全 -1）、逐点 FBO 稀疏计算（固定开销反噬）。
 
 ## 支持环境
 
-- Minecraft 26.3 / Fabric Loader 0.20.1 / Java 25
-- 渲染后端：**OpenGLES / MobileGL**（MobileGlues 2.x），GLES 3.2
-- 测试真机：HONOR AAK-AN00（骁龙 8 Elite / Adreno 830）
+- Minecraft **26.3** / Fabric Loader **0.20.1** / **Java 25**
+- 渲染后端：**OpenGLES / MobileGL**（MobileGlues 2.x，GLES 3.2）
+  > 不要用 DirectVulkan：本项目基于 EGL + GLES 绑定，Vulkan 模式下功能不可用。
+- 参考真机：HONOR AAK-AN00（骁龙 8 Elite / Adreno 830）
 
 ## 构建
 
 ```bash
 export JAVA_HOME=/path/to/jdk-25
-export LANG=C.utf8 LC_ALL=C.utf8     # 中文项目路径下必须，否则 Gradle 报 locale 错误
-/path/to/gradle-9.8.0/bin/gradle build --no-daemon --console=plain
-# 产物: build/libs/c2me-gpuworldgen-<version>.jar
+export LANG=C.utf8 LC_ALL=C.utf8    # 中文路径下必须，否则 Gradle 报 locale 错误
+./gradlew build --no-daemon --console=plain
+# 产物：build/libs/m1b-gpuworldgen-<version>.jar
 ```
 
-需要：JDK 25、Gradle 9.8+、Loom 1.19-SNAPSHOT。
+需要 JDK **25**（MC 26.3 的要求）、Gradle 9.8+（wrapper 已内置）、Loom 1.19-SNAPSHOT。
 
 ## 安装
 
-1. 渲染后端选 OpenGLES / MobileGL（**不要** DirectVulkan）
-2. 把 jar 放进 `mods/`
-3. 配置文件 `config/gpuworldgen.json`（可选，默认 enabled）。
-   若上次被强杀导致 JSON 截断，v0.11.0 会自动把坏文件备份成 `gpuworldgen.json.bak` 并重建默认配置
-   （旧版只会报 `MalformedJsonException` 然后每次启动都失败）；写配置改为 tmp + 原子替换。
-4. 进游戏 → 进世界，自动跑 GPU 验证，报告写 `<游戏目录>/gpu-worldgen-verify.txt`
+1. 把 `m1b-gpuworldgen-<version>.jar` 放进 `mods/`（**不要**同时放旧版，包名相同会互相覆盖）；
+2. 渲染后端选 **OpenGLES / MobileGL**；
+3. 进游戏 → 进世界，模组会等世界加载完成后开始 GPU 自检与（可选的）接管；
+4. 自检报告写在游戏目录的 `gpu-worldgen-verify.txt`。
 
-## 验证输出
+## 配置
 
-进世界后自动执行（**自检拆成每 tick 一轮**，不再一次性阻塞整帧，且先让区域预取铺缓存）：
-- GL 5 轮稳定性验证（每轮重新编译 shader + 自检）
-- MC 精确噪声对拍（mode 20，16384 点，超大坐标 5e6）
-- 接管统计（每 40 tick 一次）：
-
-```
-[GPUWorldGen] GPU 接管 v0.11: 提供噪声 37.42% (6860 hit / 18330 调用, 格点外 12) | 实例 5 注册 / 2 可服务 | 缓存柱=3120 | 预取 180 批 / 失败 0 批
-[GPUWorldGen] 区域预取耗时: 均 0.42 ms/批 (draw+read+抽检), 均 41.0 柱/批
-[GPUWorldGen]   实例#1: 可服务 | 格点 x=0/4 y=-512/64(49层) z=0/4 | hit=6100 miss=2100 越界=0 格点外=0 缓存柱=1849
-```
-
-## 配置项（v0.11.0）
+配置文件：`config/gpuworldgen.json`（不存在时自动创建；文件被写坏会自动备份成
+`gpuworldgen.json.bak` 并重建默认值）。
 
 | 键 | 默认 | 说明 |
-|---|---|---|
-| `enabled` | true | 总开关 |
-| `size` | 128 | 固定 128（shader 网格与对拍网格一致，改别的值会被忽略） |
-| `maxServedInstances` | 2 | 同时接管的噪声实例上限（多余的降级 CPU） |
-| `prefetchPassesPerTick` | 6 | 每 tick 最多跑几批预取（控制帧耗时） |
-| `prefetchPointsPerPass` | 2048 | 每批最多算多少格点 |
-| `prefetchMaxPasses` | 48 | 一个区域的目标批数（决定区域半径） |
-| `cacheBudgetMb` | 24 | 每个实例的柱缓存预算 |
-| `verifyDelayTicks` | 40 | 进世界后延迟多少 tick 开始自检 |
-| `writeReport` | true | 是否写 `gpu-worldgen-verify.txt` |
+| --- | --- | --- |
+| `enabled` | `true` | 总开关（关闭后完全不加载 GL） |
+| `gpuTakeover` | `true` | 是否真正接管世界生成噪声（关掉只跑自检，最稳） |
+| `maxServedInstances` | `6` | 同时接管的噪声实例上限（1~6） |
+| `prefetchPassesPerTick` | `6` | 每 tick 最多推进几批预取 |
+| `prefetchPointsPerPass` | `2048` | 单批目标格点数（决定批宽度） |
+| `prefetchMaxPasses` | `48` | 一个预取区域的目标批数 |
+| `prefetchBudgetMs` | `4.0` | 每 tick 预取时间预算（毫秒） |
+| `cacheBudgetMb` | `48` | 每个实例的柱缓存预算 |
+| `serveTolerance` | `1e-6` | 判定「落在格点上」的容差 |
+| `verifyDelayTicks` | `40` | 进世界后延迟多少 tick 开始自检 |
+| `writeReport` | `true` | 是否写 `gpu-worldgen-verify.txt` |
+| `size` | `128` | 固定 128（shader 网格与对拍网格一致，其他值会被忽略） |
+| `freq` / `workGroupSize` / `deviceType` / `libraryName` | — | 早期实验参数，保留兼容 |
 
-## v0.13.0 变更与测试方法
+## 日志与验证
 
-### 这版改了什么
-
-- **预取带宽打满**：v0.12 每次 draw 只塞 2 列（128 宽纹理用掉 1.5%），v0.13 一次塞满 128 列，
-  并拆成「每 tick 一个 y 片」推进——同样的帧预算下供给列数约 60 倍。
-- **y 窗口按需扩容**：查询 y 超出学习窗口时自动扩窗并重铺缓存（v0.12 这部分约占 16% 的无效 miss）。
-- **学习重采样**：前 600 次调用若坐标维度太单一（例如只沿一列采样）推不出步长，
-  换一个采样窗重试，最多 4 次（v0.12 会把这些实例一次性判死）。
-- **接管槽位默认 2 → 4**：`maxServedInstances` 可调（1~6）。
-- **诊断增强**：每个可服务实例打印相邻调用差分样本、`maxQy`、扩容次数、实时 y 需求区间。
-- 修掉验证报告抬头里硬编码的 v0.10.1。
-
-### 测试方法（进游戏后看这几行）
-
-1. 进世界约 30 秒后，日志里应出现 `实例#N 区域预取开始` 与 `批完成`：
-   `批完成: qx=[a..b] qz=… 列=128 片=K 安装=… 失败=0` 说明 128 列批次已在跑。
-2. 每 40 tick 一条统计：
-   `GPU 接管 v0.13: 提供噪声 X% (hit / 调用, 格点外 …) | 实例 N 注册 / M 可服务 | 缓存柱=… | 预取 … 批 / 失败 …`
-   —— 重点看 **X%** 是否比上一版（0.20%）明显上升，以及 **失败批** 是否保持 0。
-3. `区域预取耗时: 均 a ms/片` 应保持在 1~3 ms 量级（v0.12 是 8.3 ms/批却只出 2 列）。
-4. 逐实例行里 `越界` 应随 `扩容` 出现后不再快速增长；`格点外` 应只占很小比例。
-5. 跑图 3~5 分钟，确认没有崩溃、没有地形异常（错值会被抽检挡掉，若整批不一致会打印
-   `降级为 CPU fallback`，此时帧率会回落但世界不会坏）。
-6. 需要反馈时给完整日志链接即可（`latest.log` 全量）。
-
-## v0.14.0 变更与测试方法
-
-### 这版改了什么（针对 v0.13 真机日志的三个硬伤）
-
-- **预取提前 8 秒启动**：旧门禁 `isGameLoadFinished()` 在「已进世界、加载遮罩未消失」阶段一直早退，
-  而世界初次生成爆发（真机 1 秒内 83 万次调用）正好发生在这一段。现在只要 `level != null && player != null`
-  就开始预取，主菜单仍然完全不碰 GL（避免 GUI 花屏）。
-- **区域宽度按预算反推**：旧版固定 13×13，128 宽纹理一次只塞 13 列（利用率 10%），日志里 `均 0.4 柱/片`。
-  现在半径由 `缓存预算 / 层数` 反推（最大 64），一次 draw 尽量塞满。
-- **缓存不再整片清空**：旧版一超预算就 `cols.clear()`，工作集反复丢弃（缓存柱在 130/2913/3608 之间摆）。
-  现在只淘汰当前区域之外的柱。
-- **槽位 4 → 6、缓存 24MB → 48MB、单 tick 预取预算 3ms → 4ms**（都可配置）。
-- **统计升级**：新增「最近区间命中率」与「GPU 吞吐 ns/值」，可以直接看出预取到底赚不赚：
-  `最近区间: 命中 X / 调用 Y = Z% | 本区间算出 … k 值，耗时 … ms`
-  `GPU 吞吐 N ns/值 (CPU 单次 get 实测约 67 ns)`
-
-### 测试方法（进游戏后只看这 4 行）
-
-1. 进世界时（还在加载遮罩）应能看到 `实例#N 区域预取开始`，比 v0.13 明显更早。
-2. 每 40 tick 一条：`GPU 接管 v0.14: 提供噪声 X% … | 缓存柱=… | 预取 … 批 / 失败 …`
-   —— 看 X% 是否高于 v0.13 的 0.30%，以及 `失败批` 是否仍为 0。
-3. `最近区间: 命中 … = Z%` —— 这是**瞬时**命中率，站着不动与跑图时差别很大。
-4. `GPU 吞吐 N ns/值` —— 与 CPU 的 67 ns/值对比，直接说明这条 GPU 读回路径是否划算。
-5. 跑图 3~5 分钟，确认不崩、地形正常（错值会被抽检挡掉）。
-
-## v0.15.0 变更与测试方法
-
-### 根因：v0.14 在替「不存在的查询」算噪声
-
-v0.14 日志里三个数字互相印证：
-
-| 指标 | v0.14 实测 | 含义 |
-|---|---|---|
-| 命中率 | 0.42% (116019 / 27531929) | 几乎没被用到 |
-| 均 1.1 柱/片 | 片宽 128 列 | 算了 128 列，只有 1.1 列真被查 |
-| GPU 吞吐 217~380 ns/值 | CPU 单次 get 67 ns | GPU 路径反而慢 3~5 倍 |
-
-原因：v0.14 的矩形全扫 = 45×45 柱 × 1023 层 = **2,071,575 个点/区域**，
-而一个区块对单实例的真实需求只有 5×5×49 = **1225 个点** —— 白算率 99.9%。
-既然每个值都白算，吞吐再高也没意义。
-
-### 这版做了什么
-
-1. **查询模式重放**（核心）：区块第一次生成时记录真实查询点的**相对偏移**（与采样尺度无关），
-   下一个区块用同样偏移平移重放。离线验证：重放出 1225 个点，与真实查询集
-   **精确匹配（多余 0 / 漏掉 0）**，相比矩形全扫减少 **1691 倍**运算量。
-2. **稀疏 y 层**：只填算过的层，未算层写 `NaN` → 走 CPU。柱存在 ≠ 有值，
-   这样即使只算部分层也绝不返回错值。
-3. 修掉两个真 bug：重放行游标不自增（会永远算同一批）、y 层数被 128 截断（长跨度算不全）。
-4. 修「GPU 吞吐 0 ns/值」的除零显示。
-
-### 测试方法（进游戏后看这 3 行）
-
-1. 进世界后应出现：`实例#N 模式重放：K 列 × y[a..b]（样本 …，点 …）`
-   —— 看 `K 列` 是否接近真实需求（几十列），而不是 45 列全扫。
-2. 每 40 tick：
-   ```
-   GPU 接管 v0.15: 提供噪声 X% …
-   模式重放: N 次重放 / M 柱 | 缓存柱 …（稀疏层启用，未算层=CPU）
-   预取耗时: 均 a ms/片, 均 b 柱/片 | 本区间 GPU c ns/值 (CPU 单次 get 约 67 ns)
-   ```
-   —— 重点看 **X%**（v0.14 是 0.42%）和 **c ns/值**（v0.14 是 217~380）。
-3. 跑图 3~5 分钟确认不崩、地形正常。
-
-## v0.15.2 紧急修复：进世界 SIGSEGV 崩溃
-
-### 崩溃原因（我自己的 bug）
-
-真机日志尾部：
-```
-SIGSEGV (0xb) at pc=0x... C  [libc.so+0xa8174]  __memmove_aarch64_nt+0x134
-```
-
-`__memmove` 里崩 = 有代码在**越界写堆内存**。定位到 `runSlab`：
-
-- 缓冲按「本批行数」分配：`count * yLayers`（例如 25×49 = **1225** 个 float）
-- 但写入用「全局层数」当步长：`out[c * layers + dst]`，`layers` = **1023**
-- 最大写入下标 = `24×1023 + 48` = **24600**，超出分配 **23376 个 float = 93,504 字节**
-
-这 93KB 的越界写在真机上直接踩穿堆 → native SIGSEGV。离线复现测试（`StrideTest`）
-打印的正是 `write idx=2046 > alloc=1225`。
-
-### 这版修了什么
-
-1. **写入步长改用本批行数**：`runSlab(... stride)`，调用点传 `Math.max(1, inst.bYLayers)`，
-   与分配尺寸严格一致。
-2. **修正「先分配后夹取」的顺序错误**：重放分支原来先按 `yLayers` 分配、之后又把 `yLayers`
-   改小，会造成第二次越界；现在先把 `yLayers` 定稿再分配。
-3. **加硬性边界检查**：`runSlab` 入口断言 `out.length >= count*stride`，分配不足直接抛
-   `IllegalStateException`（在 Java 层报错），而不是让越界写到 native 里去崩。
-4. 矩形分支的 `bYLayers` 改为恒等于 `layers`，保证「分配/写入」永远同源。
-
-### 测试方法
-
-1. **进世界是最关键的**：v0.15.0 在进世界验证完成后立刻 SIGSEGV；这版应能正常进世界不崩。
-2. 看日志有没有 `预取缓冲越界:` —— 出现即为新断言触发（说明还有尺寸不一致，请把日志发我）。
-3. 跑图 3~5 分钟，确认：
-   - 不崩
-   - `GPU 接管 v0.15: 提供噪声 X%` 正常打印
-   - 地形正常（抽检拦错值，若整批不一致会打印 `降级为 CPU fallback`）
-
-## v0.15.3 紧急：GPU 预取默认关闭（规避 native 崩溃）
-
-### 现状
-
-v0.15.0 与 v0.15.2 都在进世界后 **SIGSEGV**，崩溃点固定在 libc：
-```
-C  [libc.so]  __memmove_aarch64_nt+0x134 / +0x154
-```
-这是 **native 层越界写**，Java 的 try/catch 兜不住，所以只能从源头消除。
-
-v0.15.2 修掉了其中两处（预取缓冲步长不一致、先分配后夹取），v0.15.3 又修掉第三处
-（`QueryPattern.replayColumns` 里 `new int[n]` 却按 2×n 写入）。但真机仍然复现，
-说明至少还有一处我没定位到 —— **继续让你反复崩着试没有意义**。
-
-### 这版的处理
-
-1. **GPU 预取默认关闭**（`config/gpuworldgen.json` 里 `gpuTakeover: false`）。
-   默认走纯 CPU 世界生成：**一定能进游戏、地形一定正确**，只是没有 GPU 加速。
-   想继续试验把这项改成 `true`（风险自负，崩溃请把日志发我）。
-2. **预取与自检串行化**：v0.15 里两者在同一 tick 内互抢 GL 状态（日志中 `saveState`
-   连续刷屏就是证据），现在自检期间不做预取。
-3. **预取熔断**：连续 3 次异常就永久停用预取并打印提示，宁可不加速也不崩游戏。
-4. **单实例隔离**：某个实例的预取出错只降级它自己，不影响其他实例、不影响游戏。
-
-### 测试方法
-
-1. 装好后直接进世界 —— **应该不再崩溃**（这是本版唯一目标）。
-2. 日志里应看到 `GPU 接管` 统计照常打印，但命中率 0%（预取关了，属预期）。
-3. 跑图 3~5 分钟确认地形正常、无卡死。
-4. 稳定后再考虑把 `gpuTakeover` 打开做实验。
-
-## v0.15.4 崩溃根因修复（这才是真正的原因）
-
-### 三次 SIGSEGV 的真正根因
-
-前三次崩溃都挂在 `C [libc.so] __memmove_aarch64_nt`，看着像「数组越界写堆」，
-所以我一轮轮去修补 `runSlab` 的步长、`replayColumns` 的扩容 —— **全部白修**。
-真正的根因是 **GL 对象句柄被跨用途复用**：
+进世界后自检会打印（`latest.log` 中搜索 `GPUWorldGen`）：
 
 ```
-compileProgram()  成功时执行：lastVs = vs;  lastFs = fs;
-ensureShadowProg() 也调用 compileProgram()  ← 预取 program 的 shader 句柄被写进 lastVs/lastFs
-自检循环每轮结尾：  glDeleteShader(lastVs); glDeleteShader(lastFs);   ← 把预取的 shader 删了
-预取随即继续：      glUniform*  到那个已经被删掉 shader 的 program 上
-```
-MobileGlues 不校验句柄有效性，往已释放的原生对象写 uniform 会破坏它内部结构，
-最终在 native 的 `__memmove` 里崩 —— 这个崩溃点和「数组越界」完全无关。
-
-**证据链**：v0.15.2 崩溃日志里，崩溃正好发生在「验证完成」之后第一波预取；
-而 v0.15.3（预取关闭）跑完整局、正常退出 `Java Exit code: 0`。
-也就是说：**只要预取在自检之后启动就会崩，只要预取不动就完全不崩。**
-
-### 修复
-
-预取 program 改为走独立的 `compileProgramStandalone()`：编译逻辑相同，但**不写
-`lastVs/lastFs`**，因此自检的 `glDeleteShader` 永远碰不到它的 shader。
-两者从此完全隔离，预取可以在自检前后任意时刻安全启动。
-
-### 测试方法
-
-1. **进世界不崩**（这是本版第一目标，前三次都是进世界后立刻崩）。
-2. 日志应看到 `接管 program 就绪` 且随后出现 `批完成` / `区域预取开始`。
-3. 看统计行 `提供噪声 X%`（v0.14 基线是 0.42%）与 `本区间 GPU c ns/值`。
-4. 跑图 5 分钟，确认地形正常、无崩溃。
-
-若仍然崩，把 `config/gpuworldgen.json` 的 `gpuTakeover` 改成 `false` 可立即回到
-纯 CPU 模式（一定能玩），并把游戏目录下的 `hs_err_pid*.log` 发我 —— 那个文件才有 native 栈。
-
-## v0.16.0 · B 路线第一阶段（探针，零风险）
-
-### 目标
-
-放弃「逐点 get 缓存」（已证明结构上赢不了 CPU 的 67ns/值，且命中率 0），改走
-**mixin 接管 `PerlinNoise.addToVolume`** —— MC 26.3 的批量噪声入口，一次带一整个
-`DensityVolume`（一个区块 × 全高）。
-
-### 本版只做「探针」：只观察、不改任何行为
-
-新增 `PerlinNoiseVolumeProbeMixin`，挂在 `addToVolume` 的 HEAD，只记录：
-- 单块形状：`sizeX×sizeY×sizeZ` 与 step（决定 GPU 一次 draw 能铺多少、格点数）
-- 块坐标范围（minBlockX/Y/Z）
-- `xzScale / yScale / amplitude`
-- **调用线程**（世界生成在 Server/Worker 线程，而 GL 上下文只在渲染线程 —— 这决定
-  GPU 结果能不能「同步」回传，是最关键的一个数）
-
-不做任何 GPU 操作、不 cancel、不改 buffer → 零风险，一定不崩。
-
-### 进游戏后看这几行（决定 B 怎么实现）
-
-```
-[GPUWorldGen][B探针] addToVolume 首次: dim=16x384x16 step=1/1/1 cells=98304 blockBase=(...)
-[GPUWorldGen][B探针]   首次 scales: xzScale=... yScale=... amplitude=...
-[GPUWorldGen][B探针]   调用线程: Server thread (isRender=false/true)
-[GPUWorldGen][B探针] 新形状#N: ...
-[GPUWorldGen][B探针] 累计 4096 块 / NNN 格子，均 NN 格子/块
+[GPUWorldGen] GPU 接管 v0.13: 提供噪声 0.30% (360320 hit / 118376326 调用, 格点外 1104348)
+              | 实例 46 注册 / 4 可服务 | 缓存柱=4063 | 预取 14560 批 / 失败 0 批
+[GPUWorldGen] 区域预取耗时: 均 1.84 ms/片 (draw+read+抽检), 均 1.4 柱/片
+[GPUWorldGen]   实例#1: 可服务 | 格点 x=-64/0.125 y=-64/0.125(1023层) z=-63.625/0.125 | hit=… miss=… 越界=…
 ```
 
-把这几行发我即可。我据此决定：
-1. 单块若 ~98304 格子（16×384×16），一次 draw 打满后每值成本可摊到 67ns 以下 → GPU 能赢；
-2. 调用线程若必在 Server thread 且需同步结果 → 必须做「跨线程阻塞等渲染帧」通道（一次 16ms），
-   这决定了 B 的真实上限，我要先确认它值不值。
+v0.16.0 额外输出 B 路线探针数据：
 
-### 约定
+```
+[GPUWorldGen][B探针] addToVolume 首次: dim=16x384x16 step=1/1/1 cells=98304 blockBase=(…)
+[GPUWorldGen][B探针]   首次 scales: xzScale=… yScale=… amplitude=…
+[GPUWorldGen][B探针]   调用线程: Server thread
+```
 
-本版**仍是纯 CPU 世界生成**（预取 probe 之外不接管任何值），与 v0.15.4 一样稳定。
+## 已知限制
 
-## 后续计划
+- 只在 **MobileGlues + OpenGLES** 后端验证过；其他 GL 驱动（尤其真实 GLES 驱动）未测。
+- GL 上下文属于渲染线程，预取只能每 tick 做一点，**无法追上进世界时的一次性生成爆发**。
+- 逐点命中模型在架构上有上限（见上文「关于命中率」），批量 `addToVolume` 路径是下一代方向。
+- 模组会修改 `config/gpuworldgen.json` 与写出验证报告，不做其他持久化改动。
 
-- v0.16+：PBO 异步回读（消除每片 glFinish 串行停顿）；按实例查询热度动态调整预算；多线程预取（渲染线程外做回读 CPU 侧比对）；批量接管 `addToVolume` 体素路径
-- 远期：Vulkan 后端支持（接口已预留）
-- 后面版本计划26.x
+## 路线图
 
-## 交付位置（约定）
+- **v0.16.x**：回收 `addToVolume` 探针数据（形状/线程/scale）→ 评估批量接管可行性
+- **v0.17+**：若批量路径成立 → 整块体素在 GPU 一次算完，用跨线程通道回传；否则转向 PBO 异步回读 + 降低固定开销
+- **远期**：Vulkan 后端（接口已预留）、多区块流水线
+- 跟随 MC 26.x 持续适配
 
-每次构建出新版模组本体后，除保留 `build/libs/` 外，还要复制到手机共享存储：
+## 文档
 
-`/storage/emulated/0/M1B-GPUWorldGen项目/<jar 名>`
-
-可用通道（直接从容器写该目录会被系统拒绝 EPERM）：
-`/app/export?path=…` 先落到 `Download/DSHA/`，再用 `adb-shell cp` 移入目标目录，
-最后 `adb-shell sha256sum` 与本地校验和逐字节核对。
+- [架构与性能分析](docs/ARCHITECTURE.md) —— 噪声数学、FFM 绑定、逐版根因推导
+- [更新日志](docs/CHANGELOG.md) —— 每个版本改了什么、为什么、怎么验证
 
 ## 协议
 
-<div align="center">Mod 采用 MIT 协议</div>
-
-<div align="center">© 2026 ZQ-斩情</div>
+MIT License，见 [LICENSE](LICENSE)。
 
 ---
 
-**免责声明**：本项目为独立 mod，引用 MC 类名用于适配，不打包分发 Minecraft 本体，本项目基本由AI编写代码
+**免责声明**：本项目为独立的 Fabric mod，仅为噪声计算适配层；不包含、不打包、不分发
+Minecraft 本体或其资源文件。Minecraft 是 Mojang Studios 的商标。
