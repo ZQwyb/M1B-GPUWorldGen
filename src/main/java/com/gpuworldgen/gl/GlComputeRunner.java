@@ -602,7 +602,9 @@ public final class GlComputeRunner {
     private long verifyT0;                          // v0.11.0: 自检总耗时起点
     private int verifyRound;                        // v0.11.0: 已完成自检轮数
     private int serviceErrors;                      // 预取异常打印次数
-    private long statTicks;                         // 统计行节流
+    private long statTicks;
+    /** v0.15.4: 自检结束后是否已重建预取 program（避免野句柄） */
+    private boolean shadowProgRebuilt;                         // 统计行节流
     private long shadowSamples, shadowOver, shadowChecks, shadowSkipBig;
     private double shadowMaxErr, shadowMaxAbsCoord;
     /** v0.9.0: dd 坐标后 float 网格限制放宽到 1e7（整数部分 <2^24 仍精确，小数走 lo 通道）。
@@ -863,8 +865,12 @@ public final class GlComputeRunner {
     /** 懒编译接管专用 program（含 mode22 uniforms）。失败退避重试（MobileGlues 编译非确定）。 */
     private void ensureShadowProg() {
         if (shadowProg >= 0) return;
-        int[] att = new int[1];
-        int p = compileProgram(att);
+        // v0.15.4: 预取 program 必须**独立编译**，不能复用 compileProgram()。
+        // compileProgram 会把 shader 句柄写进 lastVs/lastFs，而自检循环随后会
+        // glDeleteShader(lastVs/lastFs) —— 那些句柄实际属于预取的 program，
+        // 被删掉后继续往它设 uniform = 向已释放的原生对象写入 → MobileGlues 内部结构损坏
+        // → 最终在 libc 的 __memmove 里 SIGSEGV（真机两次崩溃都发生在这里）。
+        int p = compileProgramStandalone();
         if (p < 0) return;
         shadowProg = p;
         permInstId = -1;
@@ -1142,6 +1148,46 @@ public final class GlComputeRunner {
                     (double) serviceNanos / Math.max(1, servicePasses) / 1e6));
         }
         return true;
+    }
+
+    /**
+     * v0.15.4: 预取专用的独立编译路径。
+     *
+     * 与 compileProgram 的区别：**不写 lastVs/lastFs**，因此自检循环的
+     * glDeleteShader(lastVs/lastFs) 不会误删这里的 shader 句柄。
+     * 这是两次真机 SIGSEGV 的根因：预取 program 的 shader 被自检删掉后，
+     * 继续 glUniform* 到已释放的原生对象，会写坏 MobileGlues 内部结构。
+     */
+    private int compileProgramStandalone() {
+        for (int attempt = 0; attempt < 5; attempt++) {
+            int vs = compileShaderQuiet(GL_VERTEX_SHADER, VERT_SRC, attempt);
+            int fs = compileShaderQuiet(GL_FRAGMENT_SHADER, FRAG_SRC, attempt);
+            int p = (int) invoke(glCreateProgram);
+            invoke(glAttachShader, p, vs);
+            invoke(glAttachShader, p, fs);
+            invoke(glLinkProgram, p);
+            // 自检渲染（与主流程同标准：mode 1 必须 R=1 G=0）
+            invoke(glUseProgram, p);
+            int ltm = (int) invoke(glGetUniformLocation, p, arena.allocateFrom("uTestMode"));
+            if (ltm >= 0) invoke(glUniform1i, ltm, 1);
+            invoke(glBindFramebuffer, GL_FRAMEBUFFER, fbo);
+            invoke(glViewport, 0, 0, size, size);
+            invoke(glBindVertexArray, vao);
+            prepDraw();
+            invoke(glDrawArrays, GL_TRIANGLES, 0, 3);
+            invoke(glFinish);
+            MemorySegment one = arena.allocate(16);
+            invoke(glReadPixels, 0, 0, 1, 1, GL_RGBA, GL_FLOAT, one);
+            float r = one.get(ValueLayout.JAVA_FLOAT, 0);
+            float g = one.get(ValueLayout.JAVA_FLOAT, 4);
+            if (r == 1.0f && g == 0.0f) {
+                return p;
+            }
+            invoke(glDeleteProgram, p);
+            invoke(glDeleteShader, vs);
+            invoke(glDeleteShader, fs);
+        }
+        return -1;
     }
 
     /**

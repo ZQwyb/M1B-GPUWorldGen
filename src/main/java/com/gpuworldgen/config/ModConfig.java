@@ -27,15 +27,16 @@ public final class ModConfig {
     public boolean enabled = true;
 
     /**
-     * v0.15.3: GPU 预取默认**关闭**。
+     * GPU 预取开关（v0.15.4 起默认开启）。
      *
-     * 真机上 v0.15.0/v0.15.2 都会在进世界后 SIGSEGV（崩溃点在 libc 的 __memmove，
-     * 是 native 层越界写，Java 侧无法兜住）。在彻底定位之前，默认走纯 CPU 世界生成
-     * —— 游戏一定能进、地形一定正确，只是没有 GPU 加速。
+     * 之前三次崩溃的根因已定位并修复：预取 program 复用了 compileProgram()，
+     * 其 shader 句柄被写进 lastVs/lastFs，随后自检循环把它们 glDeleteShader 掉，
+     * 预取再往这个已释放的 program 设 uniform → MobileGlues 内部结构损坏 → SIGSEGV。
+     * 现在预取走独立的 compileProgramStandalone()，不再与自检共享句柄。
      *
-     * 想继续试验就把它改成 true（风险自负，并请把崩溃日志发回）。
+     * 万一仍崩溃，可把它改成 false 回到纯 CPU 世界生成（一定能玩、地形正确）。
      */
-    public boolean gpuTakeover = false;
+    public boolean gpuTakeover = true;
 
     /** 随机种子（permutation 表，仅用于自研 CPU 参考噪声，不影响 MC 原版噪声） */
     public long seed = 42L;

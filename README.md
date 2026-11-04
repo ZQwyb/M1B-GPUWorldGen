@@ -279,6 +279,43 @@ v0.15.2 修掉了其中两处（预取缓冲步长不一致、先分配后夹取
 3. 跑图 3~5 分钟确认地形正常、无卡死。
 4. 稳定后再考虑把 `gpuTakeover` 打开做实验。
 
+## v0.15.4 崩溃根因修复（这才是真正的原因）
+
+### 三次 SIGSEGV 的真正根因
+
+前三次崩溃都挂在 `C [libc.so] __memmove_aarch64_nt`，看着像「数组越界写堆」，
+所以我一轮轮去修补 `runSlab` 的步长、`replayColumns` 的扩容 —— **全部白修**。
+真正的根因是 **GL 对象句柄被跨用途复用**：
+
+```
+compileProgram()  成功时执行：lastVs = vs;  lastFs = fs;
+ensureShadowProg() 也调用 compileProgram()  ← 预取 program 的 shader 句柄被写进 lastVs/lastFs
+自检循环每轮结尾：  glDeleteShader(lastVs); glDeleteShader(lastFs);   ← 把预取的 shader 删了
+预取随即继续：      glUniform*  到那个已经被删掉 shader 的 program 上
+```
+MobileGlues 不校验句柄有效性，往已释放的原生对象写 uniform 会破坏它内部结构，
+最终在 native 的 `__memmove` 里崩 —— 这个崩溃点和「数组越界」完全无关。
+
+**证据链**：v0.15.2 崩溃日志里，崩溃正好发生在「验证完成」之后第一波预取；
+而 v0.15.3（预取关闭）跑完整局、正常退出 `Java Exit code: 0`。
+也就是说：**只要预取在自检之后启动就会崩，只要预取不动就完全不崩。**
+
+### 修复
+
+预取 program 改为走独立的 `compileProgramStandalone()`：编译逻辑相同，但**不写
+`lastVs/lastFs`**，因此自检的 `glDeleteShader` 永远碰不到它的 shader。
+两者从此完全隔离，预取可以在自检前后任意时刻安全启动。
+
+### 测试方法
+
+1. **进世界不崩**（这是本版第一目标，前三次都是进世界后立刻崩）。
+2. 日志应看到 `接管 program 就绪` 且随后出现 `批完成` / `区域预取开始`。
+3. 看统计行 `提供噪声 X%`（v0.14 基线是 0.42%）与 `本区间 GPU c ns/值`。
+4. 跑图 5 分钟，确认地形正常、无崩溃。
+
+若仍然崩，把 `config/gpuworldgen.json` 的 `gpuTakeover` 改成 `false` 可立即回到
+纯 CPU 模式（一定能玩），并把游戏目录下的 `hs_err_pid*.log` 发我 —— 那个文件才有 native 栈。
+
 ## 后续计划
 
 - v0.16+：PBO 异步回读（消除每片 glFinish 串行停顿）；按实例查询热度动态调整预算；多线程预取（渲染线程外做回读 CPU 侧比对）；批量接管 `addToVolume` 体素路径
