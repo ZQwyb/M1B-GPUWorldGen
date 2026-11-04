@@ -143,6 +143,13 @@ public final class ShadowShared {
         public final ConcurrentHashMap<Long, float[]> cols = new ConcurrentHashMap<>();
         public volatile long hits, misses, oob, offGrid;
 
+        // ---------- v0.15.0: 真实查询模式（区块内相对偏移，按区块平移重放） ----------
+        public final QueryPattern pattern = new QueryPattern();
+        /** 当前模式所属区块（格点范围 16 格区块），变化时重置 pattern */
+        private volatile int patChunkX = Integer.MIN_VALUE, patChunkZ = Integer.MIN_VALUE;
+        /** 模式重放预取次数 / 成功写入的柱数（诊断用） */
+        public volatile long replayBuilds, replayCols;
+
         // ---------- 预取区域（索引空间矩形） ----------
         public volatile boolean regionActive;
         public volatile int rQx0, rQz0, rW, rH, rRow, rCol;
@@ -227,6 +234,7 @@ public final class ShadowShared {
             }
             if (qy >= 0 && qy < n) {
                 if ((int) qy > maxQySeen) maxQySeen = (int) qy;
+                recordPattern((int) qx, (int) qy, (int) qz);
             } else {
                 // 落在格点上但超出当前 y 窗口：记下真实需求范围，渲染线程按需扩容
                 oob++;
@@ -240,7 +248,29 @@ public final class ShadowShared {
                 noteAnchor((int) qx, (int) qz);
                 return Float.NaN;
             }
-            return col[(int) qy];
+            float v = col[(int) qy];
+            if (v != v) {
+                // v0.15.0: 稀疏预取只填算过的层，未算的层是 NaN —— 必须走 CPU，
+                // 绝不能因为「柱存在」就当成有值返回（那是错的噪声值）。
+                noteAnchor((int) qx, (int) qz);
+                return Float.NaN;
+            }
+            return v;
+        }
+
+        /** v0.15.0: 记录真实查询到当前区块的查询模式；换区块时重置。 */
+        private void recordPattern(int qx, int qy, int qz) {
+            if (pattern.overflow) return;
+            int cx = qx >> 4, cz = qz >> 4;   // 16 格点为一个记录窗口
+            if (cx != patChunkX || cz != patChunkZ) {
+                patChunkX = cx;
+                patChunkZ = cz;
+                // 新窗口：重置记录（模式只保留「最近一个区块」的真实结构）
+                if (pattern.size() > 0 && pattern.samples < 400000) {
+                    pattern.reset();
+                }
+            }
+            pattern.record(qx, qy, qz);
         }
 
         private void noteAnchor(int qx, int qz) {
@@ -497,6 +527,89 @@ public final class ShadowShared {
             }
         }
 
+        // ---------- v0.15.0: 模式重放批次（稀疏列 + 稀疏 y 段） ----------
+
+        /** 重放计划：要算的 (qx,qz) 列，交错存储 */
+        public volatile int[] rpCols;
+        /** 列数 */
+        public volatile int rpCount;
+        /** 本次重放的 y 层偏移范围（相对 by 的层索引） */
+        public volatile int rpYLo, rpYHi;
+        /** 重放推进游标 */
+        public volatile int rpPos;
+        /** 重放行表：[qz, qxMin, qxCount] × n */
+        public volatile int[] bRows;
+        public volatile int bRow;
+        /** 本批的 y 层基与层数（绝对 qy 索引） */
+        public volatile int bYBase, bYCount;
+        /** 本批实际使用的 y 基与层数（矩形/重放共用） */
+        public volatile int bYBase0, bYLayers;
+
+        /**
+         * 开启一次模式重放（渲染线程调用）。
+         * 重放列按 qz 分组成「行」，每行只覆盖该行 qx 的最小~最大跨度 —— 这样相位列虽然稀疏，
+         * 跨度内的空隙也只是几十列 × 几十层，与 v0.14 的 45×45×1023（200 万点）不可同日而语。
+         */
+        public void useReplay(int[] colsQxQz, int yLo, int yHi) {
+            bRows = buildRows(colsQxQz);
+            bRow = 0;
+            bYBase = Math.max(0, yLo);
+            bYCount = Math.max(1, yHi - yLo + 1);
+            bCount = 0;
+            regionActive = false;
+            bSlab = 0;
+            bSlabs = 0;
+        }
+
+        /** 把 (qx,qz) 列集合按 qz 聚合为行：[qz, qxMin, qxCount] 三元组。 */
+        private static int[] buildRows(int[] colsQxQz) {
+            int n = colsQxQz.length / 2;
+            int[] rows = new int[n * 3];
+            int rc = 0;
+            for (int i = 0; i < n; i++) {
+                int qx = colsQxQz[i * 2], qz = colsQxQz[i * 2 + 1];
+                int hit = -1;
+                for (int r = 0; r < rc; r++) {
+                    if (rows[r * 3] == qz) { hit = r; break; }
+                }
+                if (hit < 0) {
+                    if (rc * 3 + 3 > rows.length) break;
+                    rows[rc * 3] = qz;
+                    rows[rc * 3 + 1] = qx;
+                    rows[rc * 3 + 2] = 1;
+                    rc++;
+                } else {
+                    int lo = rows[hit * 3 + 1];
+                    int hi = lo + rows[hit * 3 + 2] - 1;
+                    if (qx < lo) { rows[hit * 3 + 2] += lo - qx; rows[hit * 3 + 1] = qx; }
+                    else if (qx > hi) { rows[hit * 3 + 2] = qx - lo + 1; }
+                }
+            }
+            int[] out = new int[rc * 3];
+            System.arraycopy(rows, 0, out, 0, rc * 3);
+            return out;
+        }
+
+        /** 取下一段重放列（最多 n 列），返回到 grid 数组里：[(qx,qz),...] ，返回个数。 */
+        public int takeReplayCols(int n, int[] grid) {
+            int[] cols = rpCols;
+            if (cols == null) return 0;
+            int remain = rpCount - rpPos;
+            if (remain <= 0) { rpCols = null; return 0; }
+            int take = Math.min(n, remain);
+            for (int i = 0; i < take; i++) {
+                int src = (rpPos + i) * 2;
+                grid[i * 2] = cols[src];
+                grid[i * 2 + 1] = cols[src + 1];
+            }
+            rpPos += take;
+            return take;
+        }
+
+        public boolean replayPending() {
+            return rpCols != null && rpPos < rpCount;
+        }
+
         public int maxColumns(int budgetMb) {
             long bytes = (long) budgetMb * 1024L * 1024L;
             int cap = (int) Math.max(1024, bytes / Math.max(1, (long) layers * 4L));
@@ -586,6 +699,18 @@ public final class ShadowShared {
     public static long totalPasses() {
         long n = 0;
         for (int i = 1; i <= MAX_REG; i++) if (REG[i] != null) n += REG[i].passes;
+        return n;
+    }
+
+    public static long totalReplayBuilds() {
+        long n = 0;
+        for (int i = 1; i <= MAX_REG; i++) if (REG[i] != null) n += REG[i].replayBuilds;
+        return n;
+    }
+
+    public static long totalReplayCols() {
+        long n = 0;
+        for (int i = 1; i <= MAX_REG; i++) if (REG[i] != null) n += REG[i].replayCols;
         return n;
     }
 

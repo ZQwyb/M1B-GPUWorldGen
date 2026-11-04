@@ -1,6 +1,7 @@
 package com.gpuworldgen.gl;
 
 import com.gpuworldgen.config.ModConfig;
+import com.gpuworldgen.shadow.QueryPattern;
 import com.gpuworldgen.shadow.ShadowShared;
 import com.gpuworldgen.verify.CpuMcPerlin;
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
@@ -935,30 +936,79 @@ public final class GlComputeRunner {
         if (inst.bCount <= 0) {
             if (!inst.regionActive) {
                 if (!inst.regionNeeded()) return false;
-                // v0.14.0: 区域宽度按缓存预算反推。旧版固定 13×13，128 宽的纹理一次只塞 13 列，
-                // 剩下的 115 列全是白算的像素——这是「均 0.4 柱/片」的直接原因。
-                int radius = Math.max(6, Math.min(64, (int) (Math.sqrt((double) budgetCols) / 2.0)));
-                inst.beginRegion(radius);
-                System.out.println(String.format(
-                        "[GPUWorldGen][接管] 实例#%d 区域预取开始：锚点=(%d,%d) 半径=%d → %dx%d 柱 x %d 层（%d 片/批，预算 %d 柱）",
-                        inst.id, inst.anchorQx, inst.anchorQz, radius,
-                        inst.rW, inst.rH, layers, ySlices, budgetCols));
+                // v0.15.0: 优先用「真实查询模式重放」。v0.14 的矩形全扫算 45x45x1023 = 200 万个点，
+                // 而一个区块真实只用 ~1225 个点，白算率 99.9%（日志实证「均 1.1 柱/片」）。
+                QueryPattern pat = inst.pattern;
+                int[] replayed = null;
+                if (pat.usable()) {
+                    replayed = pat.replayColumns(inst.anchorQx, inst.anchorQz);
+                }
+                if (replayed != null && replayed.length >= 6) {
+                    inst.useReplay(replayed, pat.yOffLo(), pat.yOffHi());
+                    inst.replayBuilds++;
+                    if (debugBatches > 0) {
+                        System.out.println(String.format(
+                                "[GPUWorldGen][接管] 实例#%d 模式重放：%d 列 × y[%d..%d]（样本 %d，点 %d）",
+                                inst.id, replayed.length / 2, pat.yOffLo(), pat.yOffHi(),
+                                pat.samples, pat.size()));
+                    }
+                } else {
+                    // 模式还没攒够 → 退回 v0.14 的矩形扫描（保证初期也有覆盖）
+                    int radius = Math.max(6, Math.min(64, (int) (Math.sqrt((double) budgetCols) / 2.0)));
+                    inst.beginRegion(radius);
+                    if (debugBatches > 0 || inst.passes < 4) {
+                        System.out.println(String.format(
+                                "[GPUWorldGen][接管] 实例#%d 矩形预取（模式未就绪 %s）：锚点=(%d,%d) 半径=%d → %dx%d 柱 x %d 层",
+                                inst.id, pat.describe(), inst.anchorQx, inst.anchorQz, radius,
+                                inst.rW, inst.rH, layers));
+                    }
+                }
             }
-            if (inst.rRow >= inst.rH) { inst.regionActive = false; return false; }
-            int count = Math.min(size, inst.rW - inst.rCol);
-            float[] buf = inst.batchVals;
-            if (buf == null || buf.length != count * layers) buf = new float[count * layers];
-            inst.batchVals = buf;
-            inst.bCount = count;
-            inst.bQx0 = inst.rQx0 + inst.rCol;
-            inst.bQz = inst.rQz0 + inst.rRow;
-            inst.bSlab = 0;
-            inst.bSlabs = ySlices;
+            int[] rows = inst.bRows;
+            if (rows != null && inst.bRow < rows.length / 3) {
+                // ---- v0.15.0: 模式重放批次（一行 qz，qx 取该行跨度） ----
+                int r = inst.bRow * 3;
+                int qz = rows[r];
+                int qxMin = rows[r + 1];
+                int span = rows[r + 2];
+                int count = Math.min(size, span);
+                // v0.15.0: 层数不能按 128 截断（真实 y 跨度常达数百层），由 slabs 逐片算完
+                int totalY = Math.max(1, inst.bYCount);
+                int yLayers = Math.min(layers - inst.bYBase, totalY);
+                if (yLayers <= 0) yLayers = Math.min(totalY, layers);
+                float[] buf = inst.batchVals;
+                if (buf == null || buf.length != count * yLayers) buf = new float[count * yLayers];
+                inst.batchVals = buf;
+                inst.bCount = count;
+                inst.bQx0 = qxMin;
+                inst.bQz = qz;
+                int yBaseAbs = Math.max(0, Math.min(inst.bYBase, layers - 1));
+                yLayers = Math.min(yLayers, layers - yBaseAbs);
+                inst.bSlab = 0;
+                inst.bSlabs = Math.max(1, (yLayers + size - 1) / size);
+                // 用专属字段记录本批 y 基，交给 runSlab
+                inst.bYBase0 = yBaseAbs;
+                inst.bYLayers = yLayers;
+            } else {
+                inst.bRows = null;
+                if (inst.rRow >= inst.rH) { inst.regionActive = false; return false; }
+                int count = Math.min(size, inst.rW - inst.rCol);
+                float[] buf = inst.batchVals;
+                if (buf == null || buf.length != count * layers) buf = new float[count * layers];
+                inst.batchVals = buf;
+                inst.bCount = count;
+                inst.bQx0 = inst.rQx0 + inst.rCol;
+                inst.bQz = inst.rQz0 + inst.rRow;
+                inst.bSlab = 0;
+                inst.bSlabs = ySlices;
+                inst.bYBase0 = 0;
+                inst.bYLayers = Math.min(size, layers);
+            }
         }
 
         int count = inst.bCount;
-        int yBase = inst.bSlab * size;
-        int yn = Math.min(size, layers - yBase);
+        int yBase = inst.bYBase0 + inst.bSlab * size;
+        int yn = Math.min(size, Math.max(1, inst.bYLayers) - inst.bSlab * size);
         if (yn <= 0) { inst.bCount = 0; return false; }
 
         double baseX = inst.bx + (double) inst.bQx0 * inst.dx;
@@ -975,6 +1025,7 @@ public final class GlComputeRunner {
         // ---- 整批算完：抽查 + 安装 ----
         float[] vals = inst.batchVals;
         int qz = inst.bQz;
+        int batchLayers = Math.max(1, inst.bYLayers);
         double wz = inst.bz + (double) qz * inst.dz;
         int cached = inst.cols.size();
         if (cached > budgetCols) {
@@ -990,26 +1041,42 @@ public final class GlComputeRunner {
 
         CpuMcPerlin cpu = new CpuMcPerlin(inst.perms, inst.ox, inst.oy, inst.oz);
         int installed = 0, failed = 0;
-        int[] probes = layers > 2 ? new int[]{0, layers / 2, layers - 1}
-                : (layers > 1 ? new int[]{0, 1} : new int[]{0});
+        int yBaseAbs = inst.bYBase0;
+        int[] probes = batchLayers > 2
+                ? new int[]{0, batchLayers / 2, batchLayers - 1}
+                : (batchLayers > 1 ? new int[]{0, 1} : new int[]{0});
         for (int c = 0; c < count; c++) {
             int qx = inst.bQx0 + c;
             double wx = inst.bx + (double) qx * inst.dx;
             boolean colOk = true;
             for (int pi : probes) {
-                double wy = inst.by + (double) pi * inst.dy;
+                int qyAbs = yBaseAbs + pi;
+                if (qyAbs < 0 || qyAbs >= layers) { colOk = false; break; }
+                double wy = inst.by + (double) qyAbs * inst.dy;
                 double ref = cpu.get3(wx, wy, wz);
-                double gpuV = vals[c * layers + pi];
+                double gpuV = vals[c * batchLayers + pi];
                 if (!(Math.abs(gpuV - ref) <= 1e-5)) { colOk = false; break; }
             }
             if (!colOk) { failed++; continue; }
             long k = ShadowShared.keyOf(qx, qz);
-            if (!inst.cols.containsKey(k)) {
-                float[] col = new float[layers];
-                System.arraycopy(vals, c * layers, col, 0, layers);
+            float[] col = inst.cols.get(k);
+            if (col == null) {
+                col = new float[layers];
+                // v0.15.0: 未算的层必须是 NaN（float 默认 0 会被当成真噪声值返回 → 地形错）
+                java.util.Arrays.fill(col, Float.NaN);
                 inst.cols.put(k, col);
             }
+            // 只填本批算到的层，其余层保持 NaN（未算 = 不服务），避免返回错值
+            System.arraycopy(vals, c * batchLayers, col, yBaseAbs, Math.min(batchLayers, layers - yBaseAbs));
             installed++;
+        }
+        boolean wasReplay = inst.bRows != null;
+        if (wasReplay) {
+            inst.replayCols += installed;
+            // v0.15.0: 推进重放行游标（漏了这句会重复同一行 → 永远算同一批）
+            int rowN = inst.bRows.length / 3;
+            inst.bRow++;
+            if (inst.bRow >= rowN) inst.bRows = null;
         }
 
         inst.passes++;
@@ -1029,9 +1096,11 @@ public final class GlComputeRunner {
         }
 
         inst.bCount = 0;
-        inst.rCol += count;
-        if (inst.rCol >= inst.rW) { inst.rCol = 0; inst.rRow++; }
-        if (inst.rRow >= inst.rH) {
+        if (!wasReplay) {
+            inst.rCol += count;
+            if (inst.rCol >= inst.rW) { inst.rCol = 0; inst.rRow++; }
+        }
+        if (!wasReplay && inst.rRow >= inst.rH) {
             inst.regionActive = false;
             System.out.println(String.format(
                     "[GPUWorldGen][接管] 实例#%d 区域完成：%d 柱，缓存共 %d 柱，GPU 均 %.2f ms/片",
@@ -1122,6 +1191,10 @@ public final class GlComputeRunner {
                         + " | 实例 %d 注册 / %d 可服务 | 缓存柱=%d | 预取 %d 批 / 失败 %d 批",
                 rate, hit, calls, ShadowShared.offLattice.get(), reg, served,
                 ShadowShared.totalColumns(), servicePasses, ShadowShared.totalFailPasses()));
+        System.out.println(String.format(
+                "[GPUWorldGen] 模式重放: %d 次重放 / %d 柱 | 缓存柱 %d（稀疏层启用，未算层=CPU）",
+                ShadowShared.totalReplayBuilds(), ShadowShared.totalReplayCols(),
+                ShadowShared.totalColumns()));
         if (ivCalls > 0) {
             System.out.println(String.format(
                     "[GPUWorldGen] 最近区间: 命中 %d / 调用 %d = %.2f%% | 本区间算出 %.0f k 值，耗时 %.0f ms",
@@ -1130,10 +1203,10 @@ public final class GlComputeRunner {
         if (servicePasses > 0) {
             double nsPerValue = ivValues > 0 ? (double) ivNanos / ivValues : 0;
             System.out.println(String.format(
-                    "[GPUWorldGen] 区域预取耗时: 均 %.2f ms/片 (draw+read+抽检), 均 %.1f 柱/片,"
-                            + " GPU 吞吐 %.0f ns/值 (CPU 单次 get 实测约 67 ns)",
+                    "[GPUWorldGen] 预取耗时: 均 %.2f ms/片, 均 %.1f 柱/片 | 本区间 GPU %s (CPU 单次 get 约 67 ns)",
                     (double) serviceNanos / servicePasses / 1e6,
-                    (double) ShadowShared.totalColumns() / servicePasses, nsPerValue));
+                    (double) ShadowShared.totalColumns() / servicePasses,
+                    ivValues > 0 ? String.format("%.0f ns/值", nsPerValue) : "无新值"));
         }
         for (int i = 1; i <= 32; i++) {
             ShadowShared.Instance inst = ShadowShared.get(i);
@@ -1146,6 +1219,12 @@ public final class GlComputeRunner {
                     ShadowShared.fmt(inst.by), ShadowShared.fmt(inst.dy), inst.layers,
                     ShadowShared.fmt(inst.bz), ShadowShared.fmt(inst.dz),
                     inst.hits, inst.misses, inst.oob, inst.offGrid, inst.cols.size(), inst.diagExtra()));
+            if (inst.ok || inst.pattern.baseSet()) {
+                System.out.println(String.format(
+                        "[GPUWorldGen]   实例#%d 查询模式: %s | 重放 %d 次 / %d 柱 | 稀疏层 y跨度 %d",
+                        inst.id, inst.pattern.describe(), inst.replayBuilds, inst.replayCols,
+                        inst.pattern.baseSet() ? (inst.pattern.yOffHi() - inst.pattern.yOffLo() + 1) : 0));
+            }
         }
     }
 
