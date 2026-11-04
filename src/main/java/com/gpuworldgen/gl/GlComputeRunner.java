@@ -966,16 +966,21 @@ public final class GlComputeRunner {
             }
             int[] rows = inst.bRows;
             if (rows != null && inst.bRow < rows.length / 3) {
-                // ---- v0.15.0: 模式重放批次（一行 qz，qx 取该行跨度） ----
+                // ---- v0.15.1: 用查询模式**定位**热点，但批次仍然打满 FBO ----
+                // 两点回归实测：每次 draw 固定开销 F≈0.90 ms，几乎不随点数下降；
+                // 所以「少算」不会更快，反而让每值成本飙升（稀疏 1225 值 = 794 ns/值，比 CPU 慢 12 倍）。
+                // 正确做法：模式只决定「从哪一列开始」，一次仍算满 128 列 × 全部层，把 F 摊薄。
                 int r = inst.bRow * 3;
                 int qz = rows[r];
                 int qxMin = rows[r + 1];
                 int span = rows[r + 2];
-                int count = Math.min(size, span);
+                int count = Math.min(size, Math.max(span, size));
                 // v0.15.0: 层数不能按 128 截断（真实 y 跨度常达数百层），由 slabs 逐片算完
+                // 层数同样拉满（用满 y 窗口），不按模式裁剪 —— 裁剪只会抬高每值成本
                 int totalY = Math.max(1, inst.bYCount);
                 int yLayers = Math.min(layers - inst.bYBase, totalY);
                 if (yLayers <= 0) yLayers = Math.min(totalY, layers);
+                yLayers = Math.min(layers, Math.max(yLayers, size));
                 float[] buf = inst.batchVals;
                 if (buf == null || buf.length != count * yLayers) buf = new float[count * yLayers];
                 inst.batchVals = buf;
