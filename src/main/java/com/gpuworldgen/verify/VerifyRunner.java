@@ -124,7 +124,7 @@ public final class VerifyRunner {
         line("");
         line("[3] 提交 GL 多轮稳定性验证（每轮重新编译 shader；等待渲染线程 tick）...");
         long gpuT0 = System.nanoTime();
-        GlComputeRunner gpu = new GlComputeRunner(report);
+        GlComputeRunner gpu = new GlComputeRunner(report, config);
 
         // v0.7.0: MC 精确噪声对拍参数（必须在 runDiagnostics 前设置，onTick 第 1 轮会跑 mode 20）
         // offsets 转 float 再回 double，与 GPU float uniform 完全一致 → 纯算法比对（不受 offsets 精度干扰）

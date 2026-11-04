@@ -1,5 +1,6 @@
 package com.gpuworldgen.gl;
 
+import com.gpuworldgen.config.ModConfig;
 import com.gpuworldgen.shadow.ShadowShared;
 import com.gpuworldgen.verify.CpuMcPerlin;
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
@@ -98,6 +99,9 @@ public final class GlComputeRunner {
             uniform float uOffX;             // v0.7.0: MC offsetX
             uniform float uOffY;             // v0.7.0: MC offsetY（2D 采样 y 切面常量）
             uniform float uOffZ;             // v0.7.0: MC offsetZ
+            uniform vec2 uGY0;              // v0.11.0: mode22 本批 y 基（dd，已含 offsetY）
+            uniform vec2 uDx;               // v0.11.0: mode22 学习到的格点步长（dd，float 化会在 2/3 这类步长上失准）
+            uniform vec2 uDy;
 
             out vec4 fragColor;
 
@@ -327,24 +331,19 @@ public final class GlComputeRunner {
                     return;
                 }
 
-                // ========== v0.10.0: mode 21 = GPU 柱批量预生成（区块 16x16 柱 x 384 层）==========
-                // 6 次 draw 覆盖整区块：柱组 uColSlice*128（0..255）+ 高度层 uYSlice*128（0..383）。
-                // 坐标 = 格点（整数）：x = blockX + col%16，z = blockZ + col/16，y = minY + yl。
-                // 与 mode20 同一 dd 坐标链 + MC 精确噪声，输出 [hi,lo] 供 CPU 抽检比对后写入柱缓存。
-                if (uTestMode == 21) {
-                    int col = px.x + uColSlice * 128;       // 0..255 区块内柱号
-                    int yl = px.y + uYSlice * 128;          // 0..383 高度层
-                    float cx = float(col % 16);
-                    float cz = float(col / 16);
-                    dd x0 = mk_dd(uX0.x, uX0.y);
-                    x0 = dd_add(x0, mk_dd(uOffX, 0.0));
-                    x0 = dd_add(x0, mk_dd(cx, 0.0));
+                // ========== v0.11.0: mode 22 = 区域批量预取（任意格点步长）==========
+                // 每像素 = 「一列 x 一层」：col = px.x（本批第几列），yl = px.y（本批第几层）。
+                // caller 坐标：x = 列基 + col*uDx，z = 行基（每批常量），y = 层基 + yl*uDy，
+                // 再各自 + offset 得到 MC 内部坐标（GradientNoise.wrap 在 |c|<1.67e7 内恒等）。
+                // 输出 [hi,lo]，CPU 侧抽检通过后才写入柱缓存（不通过 = 永久 CPU fallback）。
+                if (uTestMode == 22) {
+                    int colx = px.x;
+                    int yl = px.y;
+                    // 坐标 = (caller 基坐标 + offset) + 索引 * 步长，全部走 dd：
+                    // offset 在 Java 侧用 double 折进基坐标，与 MC 的 double offset 完全一致。
+                    dd x0 = dd_add(mk_dd(uX0.x, uX0.y), dd_mul(mk_dd(uDx.x, uDx.y), mk_dd(float(colx), 0.0)));
                     dd z0 = mk_dd(uY0.x, uY0.y);
-                    z0 = dd_add(z0, mk_dd(uOffZ, 0.0));
-                    z0 = dd_add(z0, mk_dd(cz, 0.0));
-                    dd y0 = mk_dd(uMinY, 0.0);
-                    y0 = dd_add(y0, mk_dd(uOffY, 0.0));    // + offsetY（MC get(DDD)F: y 世界坐标 = 传入 y + offsetY）
-                    y0 = dd_add(y0, mk_dd(float(yl), 0.0));
+                    dd y0 = dd_add(mk_dd(uGY0.x, uGY0.y), dd_mul(mk_dd(uDy.x, uDy.y), mk_dd(float(yl), 0.0)));
 
                     int xi = int(floor(x0.hi));
                     if (fract(x0.hi) == 0.0 && x0.lo < 0.0) xi -= 1;
@@ -378,16 +377,16 @@ public final class GlComputeRunner {
                     dd d011 = mc_grad(c011, xf, dd_sub(yf, one), dd_sub(zf, one));
                     dd d111 = mc_grad(c111, dd_sub(xf, one), dd_sub(yf, one), dd_sub(zf, one));
 
-                    dd u21 = dd_fade(xf), v21 = dd_fade(yf), w21 = dd_fade(zf);
-                    dd l00 = dd_lerp(u21, d000, d100);
-                    dd l10 = dd_lerp(u21, d010, d110);
-                    dd l01 = dd_lerp(u21, d001, d101);
-                    dd l11 = dd_lerp(u21, d011, d111);
-                    dd y0v = dd_lerp(v21, l00, l10);
-                    dd y1v = dd_lerp(v21, l01, l11);
-                    dd res21 = dd_lerp(w21, y0v, y1v);
+                    dd u22 = dd_fade(xf), v22 = dd_fade(yf), w22 = dd_fade(zf);
+                    dd l00 = dd_lerp(u22, d000, d100);
+                    dd l10 = dd_lerp(u22, d010, d110);
+                    dd l01 = dd_lerp(u22, d001, d101);
+                    dd l11 = dd_lerp(u22, d011, d111);
+                    dd yl0 = dd_lerp(v22, l00, l10);
+                    dd yl1 = dd_lerp(v22, l01, l11);
+                    dd res22 = dd_lerp(w22, yl0, yl1);
 
-                    fragColor = vec4(res21.hi, res21.lo, 0.0, 0.0);
+                    fragColor = vec4(res22.hi, res22.lo, 0.0, 0.0);
                     return;
                 }
 
@@ -517,9 +516,14 @@ public final class GlComputeRunner {
             """;
 
     private final StringBuilder report;
+    private final ModConfig cfg;
 
     // ---------- FFM ----------
     private final Arena arena = Arena.ofShared();
+    /** v0.11.0: 回读复用缓冲（size*size RGBA float），避免每批分配 */
+    private MemorySegment ioBuf;
+    /** v0.11.0: 当前 shadowProg 里已上传的 permU 所属实例 id（-1=需重传） */
+    private int permInstId = -1;
     private final Linker linker = Linker.nativeLinker();
 
     // ---------- GLES 函数 ----------
@@ -582,10 +586,16 @@ public final class GlComputeRunner {
     private int shadowProg = -1;             // 影子比对专用 program（保留到游戏结束，不删）
     private int spPermU = -1, spFreq = -1, spTestMode = -1, spX0 = -1, spY0 = -1;
     private int spOffX = -1, spOffY = -1, spOffZ = -1;
-    private int spColSlice = -1, spYSlice = -1;   // v0.10.0: mode21 柱组/高度层偏移
-    private int spMinY = -1;                        // v0.10.0: mode21 柱起始高度
-    private int pregenTickCount;                    // v0.10.0: 预生成节流计数
-    private long pregenNanos;
+    private int spGY0 = -1, spDx = -1, spDy = -1;   // v0.11.0: mode22 区域预取 uniforms
+    private int progBackoff;                        // shader 编译失败退避（tick）
+    private long serviceNanos;                      // v0.11.0: 预取累计 GL 耗时
+    private long servicePasses;                     // v0.11.0: 预取批次数
+    private long tickCount;                         // v0.11.0: 进入世界后的 tick 计数
+    private long verifyStartTick = -1;              // v0.11.0: 自检开始 tick（-1=未开始）
+    private long verifyT0;                          // v0.11.0: 自检总耗时起点
+    private int verifyRound;                        // v0.11.0: 已完成自检轮数
+    private int serviceErrors;                      // 预取异常打印次数
+    private long statTicks;                         // 统计行节流
     private long shadowSamples, shadowOver, shadowChecks, shadowSkipBig;
     private double shadowMaxErr, shadowMaxAbsCoord;
     /** v0.9.0: dd 坐标后 float 网格限制放宽到 1e7（整数部分 <2^24 仍精确，小数走 lo 通道）。
@@ -623,8 +633,10 @@ public final class GlComputeRunner {
     /** v0.7.0: MC 精确噪声 GPU 复刻结果（mode 20 输出 [hi,lo] 对） */
     public float[] mcResult() { return mcResult; }
 
-    public GlComputeRunner(StringBuilder report) {
+    public GlComputeRunner(StringBuilder report, ModConfig cfg) {
         this.report = report;
+        this.cfg = cfg != null ? cfg : new ModConfig();
+        ShadowShared.configure(this.cfg.maxServedInstances);
         ClientTickEvents.END_CLIENT_TICK.register(this::onTick);
     }
 
@@ -652,102 +664,117 @@ public final class GlComputeRunner {
 
     private void onTick(net.minecraft.client.Minecraft client) {
         try {
-            if (done == null) {
-                // v0.8.0: 验证已完成 → 持续影子比对；v0.10.0: 接管激活后改 GPU 预生成（真提供噪声值）
-                if (verifyDone && initDone && initError == null) {
-                    if (ShadowShared.takeoverActive) {
-                        try { pregenTick(); }
-                        catch (Throwable pt) { System.out.println("[GPUWorldGen] 预生成异常: " + pt); }
-                    } else {
-                        try { shadowTickOnce(); }
-                        catch (Throwable st) { System.out.println("[GPUWorldGen] 影子比对异常: " + st); }
-                    }
-                }
-                return;
-            }
-            // v0.8.5: 验证改到【进入世界后】再跑——主菜单阶段完全不碰 GL，杜绝 0.8.2-0.8.4
-            // 在主菜单后验证导致的文字花屏；加载画面（splash）也完全不碰 GL，杜绝红屏。
-            // 进入世界后游戏内渲染稳定，验证一次性跑完（~1s 卡顿可接受），由 0.6.9 的全套
-            // saveState/restoreState 兜底恢复。主菜单文字不再花屏（不验证就不污染）。
-            if (!client.isGameLoadFinished() || client.player == null) {
-                return;   // splash / 主菜单期间不渲染，等进入世界再验证
-            }
+            // 主菜单 / splash 完全不碰 GL（v0.8.5 教训：主菜单验证会导致 GUI 文字花屏）
+            if (!client.isGameLoadFinished() || client.player == null) return;
+            tickCount++;
             if (!initDone) {
-                initResources();   // 一次性资源（dlopen + bind + 输出纹理 + FBO + VAO）
+                initResources();
                 initDone = true;
             }
-            if (initError != null) { release(); return; }
+            if (initError != null) { if (done != null) release(); return; }
 
-            saveState();   // 保存游戏当前帧缓冲 / viewport / 清屏色
-
-            int n = reqInput.length / 4;
-            int R = STABILITY_ROUNDS;
-            roundAttempts = new int[R];
-            roundStdNoise = new float[R][];
-            roundBigNoise = new float[R][];
-            roundBigMode9 = new float[R][];
-            roundNanos = new long[R];
-            long totalT0 = System.nanoTime();
-
-            for (int r = 0; r < R; r++) {
-                report.append("    [GL] ===== 稳定性第 ").append(r + 1).append(" / ").append(R)
-                        .append(" 轮（重新编译 shader）=====\n");
-                long t0 = System.nanoTime();
-                int[] att = new int[1];
-                int p = compileProgram(att);
-                if (p < 0) {
-                    roundAttempts[r] = -att[0];
-                    report.append("    [GL] 第 ").append(r + 1).append(" 轮编译自检 5 次均失败\n");
-                    roundNanos[r] = System.nanoTime() - t0;
-                    continue;
-                }
-                roundAttempts[r] = att[0];
-                prog = p;
-                // 每轮 program 是新建的，重新查 uniform locations
-                locPermU = (int) invoke(glGetUniformLocation, prog, arena.allocateFrom("permU"));
-                locFreq = (int) invoke(glGetUniformLocation, prog, arena.allocateFrom("uFreq"));
-                locTestMode = (int) invoke(glGetUniformLocation, prog, arena.allocateFrom("uTestMode"));
-                locX0 = (int) invoke(glGetUniformLocation, prog, arena.allocateFrom("uX0"));
-                locY0 = (int) invoke(glGetUniformLocation, prog, arena.allocateFrom("uY0"));
-                locOffX = (int) invoke(glGetUniformLocation, prog, arena.allocateFrom("uOffX"));
-                locOffY = (int) invoke(glGetUniformLocation, prog, arena.allocateFrom("uOffY"));
-                locOffZ = (int) invoke(glGetUniformLocation, prog, arena.allocateFrom("uOffZ"));
-
-                float[][] std = runAllModes(n, reqFreq, 0.0f, 0.0f);
-                float[][] big = runAllModes(n, reqFreq, BIG_OFFSET, BIG_OFFSET);
-                roundStdNoise[r] = std[0];
-                roundBigNoise[r] = big[0];
-                roundBigMode9[r] = big[9];
-                roundNanos[r] = System.nanoTime() - t0;
-
-                // v0.7.0: 第 1 轮编译成功后跑一次 MC 精确噪声对拍（mode 20）
-                if (r == 0 && mcRequested) {
-                    long mt0 = System.nanoTime();
-                    mcResult = runMcMode(n, mcFreq, mcX0, mcY0, (float) mcOx, (float) mcOy, (float) mcOz);
-                    report.append("    [GL] MC 精确噪声对拍（mode 20）耗时: ")
-                            .append(String.format("%.0f", (System.nanoTime() - mt0) / 1e6)).append(" ms\n");
-                }
-
-                // 兼容旧字段（指向最后一轮成功结果）
-                diagResults = std;
-                diagBigAll = big;
-                diagBig = big[0];
-
-                // 删除本轮 program + shaders（下一轮重新编译，避免对象泄漏）
-                invoke(glDeleteShader, lastVs);
-                invoke(glDeleteShader, lastFs);
-                invoke(glDeleteProgram, p);
+            // ---- v0.11.0 第一优先：区域预取 ----
+            // 区块初次生成是「毫秒级一次性爆发」（真机日志：8 秒 83 万次查询），缓存必须在它
+            // 之前/同时就位；旧的异步按区块补丁永远追不上，这是 0.0% 命中的根因。
+            try {
+                serviceTakeover();
+            } catch (Throwable st) {
+                if (serviceErrors++ < 5) System.out.println("[GPUWorldGen] 区域预取异常: " + st);
             }
-            gpuNanos = System.nanoTime() - totalT0;
-            restoreState();
-            verifyDone = true;
-            release();
+
+            // ---- 第二优先：稳定性自检（每 tick 最多一轮，不再整帧阻塞） ----
+            if (done != null) runVerifyStep();
         } catch (Throwable t) {
             initError = t.toString();
             report.append("    [GL] tick 异常: ").append(t).append('\n');
             try { restoreState(); } catch (Throwable ignored) {}
             release();
         }
+    }
+
+    /** v0.11.0: 自检拆成每 tick 一轮；延迟 verifyDelayTicks 让预取先铺缓存。 */
+    private void runVerifyStep() {
+        if (verifyStartTick < 0) {
+            verifyStartTick = tickCount;
+            verifyT0 = System.nanoTime();
+            int R = STABILITY_ROUNDS;
+            roundAttempts = new int[R];
+            roundStdNoise = new float[R][];
+            roundBigNoise = new float[R][];
+            roundBigMode9 = new float[R][];
+            roundNanos = new long[R];
+            report.append("    [GL] 自检延后 ").append(Math.max(0, cfg.verifyDelayTicks))
+                    .append(" tick 开始（先让区域预取铺缓存）\n");
+        }
+        if (tickCount - verifyStartTick < Math.max(0, cfg.verifyDelayTicks)) return;
+        if (verifyRound >= STABILITY_ROUNDS) {
+            finishVerify();
+            return;
+        }
+        int r = verifyRound;
+        saveState();
+        try {
+            doVerifyRound(r);
+        } finally {
+            restoreState();
+        }
+        verifyRound++;
+        if (verifyRound >= STABILITY_ROUNDS) finishVerify();
+    }
+
+    private void finishVerify() {
+        gpuNanos = System.nanoTime() - verifyT0;
+        verifyDone = true;
+        printStats(true);
+        release();
+    }
+
+    /** 跑一轮自检（调用方保证 saveState/restoreState）。 */
+    private void doVerifyRound(int r) {
+        report.append("    [GL] ===== 稳定性第 ").append(r + 1).append(" / ").append(STABILITY_ROUNDS)
+                .append(" 轮（重新编译 shader）=====\n");
+        long t0 = System.nanoTime();
+        int[] att = new int[1];
+        int p = compileProgram(att);
+        if (p < 0) {
+            roundAttempts[r] = -att[0];
+            report.append("    [GL] 第 ").append(r + 1).append(" 轮编译自检 5 次均失败\n");
+            roundNanos[r] = System.nanoTime() - t0;
+            return;
+        }
+        roundAttempts[r] = att[0];
+        prog = p;
+        locPermU = (int) invoke(glGetUniformLocation, prog, arena.allocateFrom("permU"));
+        locFreq = (int) invoke(glGetUniformLocation, prog, arena.allocateFrom("uFreq"));
+        locTestMode = (int) invoke(glGetUniformLocation, prog, arena.allocateFrom("uTestMode"));
+        locX0 = (int) invoke(glGetUniformLocation, prog, arena.allocateFrom("uX0"));
+        locY0 = (int) invoke(glGetUniformLocation, prog, arena.allocateFrom("uY0"));
+        locOffX = (int) invoke(glGetUniformLocation, prog, arena.allocateFrom("uOffX"));
+        locOffY = (int) invoke(glGetUniformLocation, prog, arena.allocateFrom("uOffY"));
+        locOffZ = (int) invoke(glGetUniformLocation, prog, arena.allocateFrom("uOffZ"));
+
+        int n = reqInput.length / 4;
+        float[][] std = runAllModes(n, reqFreq, 0.0f, 0.0f);
+        float[][] big = runAllModes(n, reqFreq, BIG_OFFSET, BIG_OFFSET);
+        roundStdNoise[r] = std[0];
+        roundBigNoise[r] = big[0];
+        roundBigMode9[r] = big[9];
+        roundNanos[r] = System.nanoTime() - t0;
+
+        if (r == 0 && mcRequested) {
+            long mt0 = System.nanoTime();
+            mcResult = runMcMode(n, mcFreq, mcX0, mcY0, (float) mcOx, (float) mcOy, (float) mcOz);
+            report.append("    [GL] MC 精确噪声对拍（mode 20）耗时: ")
+                    .append(String.format("%.0f", (System.nanoTime() - mt0) / 1e6)).append(" ms\n");
+        }
+
+        diagResults = std;
+        diagBigAll = big;
+        diagBig = big[0];
+
+        invoke(glDeleteShader, lastVs);
+        invoke(glDeleteShader, lastFs);
+        invoke(glDeleteProgram, p);
     }
 
     private void release() {
@@ -811,32 +838,155 @@ public final class GlComputeRunner {
         }
     }
 
-    // ================= v0.10.0 GPU 接管：预生成 =================
+    // ================= v0.11.0 GPU 接管：区域预取服务 =================
 
-    /** 懒编译影子/接管专用 program（含 mode21 uniforms）。编译失败返回负值，下轮重试。 */
+    /** 懒编译接管专用 program（含 mode22 uniforms）。失败退避重试（MobileGlues 编译非确定）。 */
     private void ensureShadowProg() {
         if (shadowProg >= 0) return;
         int[] att = new int[1];
-        shadowProg = compileProgram(att);
-        if (shadowProg < 0) return;
+        int p = compileProgram(att);
+        if (p < 0) return;
+        shadowProg = p;
+        permInstId = -1;
         spPermU = (int) invoke(glGetUniformLocation, shadowProg, arena.allocateFrom("permU"));
         spFreq = (int) invoke(glGetUniformLocation, shadowProg, arena.allocateFrom("uFreq"));
         spTestMode = (int) invoke(glGetUniformLocation, shadowProg, arena.allocateFrom("uTestMode"));
         spX0 = (int) invoke(glGetUniformLocation, shadowProg, arena.allocateFrom("uX0"));
         spY0 = (int) invoke(glGetUniformLocation, shadowProg, arena.allocateFrom("uY0"));
+        spGY0 = (int) invoke(glGetUniformLocation, shadowProg, arena.allocateFrom("uGY0"));
         spOffX = (int) invoke(glGetUniformLocation, shadowProg, arena.allocateFrom("uOffX"));
         spOffY = (int) invoke(glGetUniformLocation, shadowProg, arena.allocateFrom("uOffY"));
         spOffZ = (int) invoke(glGetUniformLocation, shadowProg, arena.allocateFrom("uOffZ"));
-        spColSlice = (int) invoke(glGetUniformLocation, shadowProg, arena.allocateFrom("uColSlice"));
-        spYSlice = (int) invoke(glGetUniformLocation, shadowProg, arena.allocateFrom("uYSlice"));
-        spMinY = (int) invoke(glGetUniformLocation, shadowProg, arena.allocateFrom("uMinY"));
+        spDx = (int) invoke(glGetUniformLocation, shadowProg, arena.allocateFrom("uDx"));
+        spDy = (int) invoke(glGetUniformLocation, shadowProg, arena.allocateFrom("uDy"));
+        System.out.println("[GPUWorldGen][接管] mode22 预取 program 就绪");
     }
 
-    /** v0.10.0: GPU 预生成一个区块（16x16 柱 x 384 层），6 次 mode21 draw + 回读。返回 cols[col*384+yl]。 */
-    private float[] runMcColumns(int blockX, int blockZ) {
-        invoke(glUseProgram, shadowProg);
-        invoke(glBindVertexArray, vao);
-        byte[] rp = ShadowShared.realPerms;
+    /**
+     * 每 tick 调一次：给每个可服务实例推进若干批区域预取。
+     * 没有可服务实例时退回 v0.8.0 的 2D 影子比对（有限次）。
+     */
+    private void serviceTakeover() {
+        if (!ShadowShared.anyServable()) {
+            try { shadowTickOnce(); } catch (Throwable ignored) {}
+            return;
+        }
+        if (shadowProg < 0) {
+            if (progBackoff > 0) { progBackoff--; return; }
+            ensureShadowProg();
+            if (shadowProg < 0) { progBackoff = 40; return; }
+        }
+        int budget = Math.max(1, cfg.prefetchPassesPerTick);
+        long limit = (long) (Math.max(0.5, cfg.prefetchBudgetMs) * 1e6);
+        long t0 = System.nanoTime();
+        saveState();
+        try {
+            outer:
+            for (ShadowShared.Instance inst : ShadowShared.servable()) {
+                for (int i = 0; i < budget; i++) {
+                    if (!runOnePass(inst)) break;
+                    // v0.11.0: 帧时间硬预算——预取再急也不能把渲染线程拖崩
+                    if (System.nanoTime() - t0 > limit) break outer;
+                }
+            }
+        } finally {
+            restoreState();
+        }
+        if (++statTicks % 40 == 0) printStats(false);
+    }
+
+    /**
+     * 推进一批：矩形区域按行扫描，一批 = 若干列 × 全部 y 层。
+     * @return false 表示当前没有可推进的活（区域未确定 / 已完成 / 实例已降级）
+     */
+    private boolean runOnePass(ShadowShared.Instance inst) {
+        if (!inst.ok) return false;
+        int layers = Math.max(1, inst.layers);
+        int ySlices = (layers + size - 1) / size;
+        int colsPerPass = Math.max(1, Math.min(size, cfg.prefetchPointsPerPass / layers));
+
+        if (!inst.regionActive) {
+            if (!inst.regionNeeded()) return false;
+            int radius = inst.regionRadius(Math.max(1, cfg.prefetchMaxPasses), colsPerPass);
+            inst.beginRegion(radius);
+            System.out.println(String.format(
+                    "[GPUWorldGen][接管] 实例#%d 区域预取开始：锚点=(%d,%d) 半径=%d → %dx%d 柱 x %d 层 (约 %.0f KB)",
+                    inst.id, inst.anchorQx, inst.anchorQz, radius, inst.rW, inst.rH, layers,
+                    (double) inst.rW * inst.rH * layers * 4.0 / 1024.0));
+        }
+        if (inst.rRow >= inst.rH) { inst.regionActive = false; return false; }
+
+        int count = Math.min(colsPerPass, inst.rW - inst.rCol);
+        int qz = inst.rQz0 + inst.rRow;
+        double baseX = inst.bx + (double) (inst.rQx0 + inst.rCol) * inst.dx;
+        double baseZ = inst.bz + (double) qz * inst.dz;
+
+        long t0 = System.nanoTime();
+        float[] vals = runRegionPass(inst, baseX, baseZ, count, ySlices);
+        long dt = System.nanoTime() - t0;
+        if (vals == null) return false;
+        serviceNanos += dt;
+        servicePasses++;
+
+        int budgetCols = inst.maxColumns(Math.max(8,
+                cfg.cacheBudgetMb / Math.max(1, ShadowShared.servedCount())));
+        int cached = inst.cols.size();
+        if (cached > budgetCols) {
+            inst.cols.clear();
+            System.out.println("[GPUWorldGen][接管] 实例#" + inst.id + " 缓存超预算（"
+                    + cached + " 柱 > " + budgetCols + "），清空重建");
+        }
+
+        CpuMcPerlin cpu = new CpuMcPerlin(inst.perms, inst.ox, inst.oy, inst.oz);
+        double wz = inst.bz + (double) qz * inst.dz;
+        int installed = 0, failed = 0;
+        for (int c = 0; c < count; c++) {
+            int qx = inst.rQx0 + inst.rCol + c;
+            double wx = inst.bx + (double) qx * inst.dx;
+            boolean colOk = true;
+            // 抽检首/中/尾三层，与 MC 精确 CPU 参考比（容差 1e-5）；不通过 → 该柱不写入
+            int[] probes = layers > 2 ? new int[]{0, layers / 2, layers - 1} : (layers > 1 ? new int[]{0, 1} : new int[]{0});
+            for (int pi : probes) {
+                double wy = inst.by + (double) pi * inst.dy;
+                double ref = cpu.get3(wx, wy, wz);
+                double gpuV = vals[c * layers + pi];
+                if (!(Math.abs(gpuV - ref) <= 1e-5)) { colOk = false; break; }
+            }
+            if (!colOk) { failed++; continue; }
+            long k = ShadowShared.keyOf(qx, qz);
+            if (!inst.cols.containsKey(k)) {
+                float[] col = new float[layers];
+                System.arraycopy(vals, c * layers, col, 0, layers);
+                inst.cols.put(k, col);
+            }
+            installed++;
+        }
+
+        inst.passes++;
+        inst.columns += installed;
+        if (failed > 0) inst.failPasses++;
+        if (failed >= count) {
+            // 连续 3 批全失败才降级：单批偶发失败（上下文抖动）不该永久废掉接管
+            if (++inst.failStreak >= 3) inst.disable("连续 3 批抽检全失败（GPU 与 CPU 参考不一致，绝不返回错值）");
+        } else {
+            inst.failStreak = 0;
+        }
+
+        inst.rCol += count;
+        if (inst.rCol >= inst.rW) { inst.rCol = 0; inst.rRow++; }
+        if (inst.rRow >= inst.rH) {
+            inst.regionActive = false;
+            System.out.println(String.format("[GPUWorldGen][接管] 实例#%d 区域完成：%d 柱，累计 %d 柱，GPU 均 %.2f ms/批",
+                    inst.id, inst.rW * inst.rH, inst.cols.size(),
+                    (double) serviceNanos / Math.max(1, servicePasses) / 1e6));
+        }
+        return true;
+    }
+
+    /** 把实例的 perm 表上传到 shadowProg（同实例只传一次；换实例/换 program 才重传）。 */
+    private void uploadPerms(ShadowShared.Instance inst) {
+        if (permInstId == inst.id) return;
+        byte[] rp = inst.perms;
         float[] permU = new float[512];
         for (int i = 0; i < 512; i++) permU[i] = rp[i & 255];
         MemorySegment permUSeg = arena.allocate(512L * 4);
@@ -844,96 +994,87 @@ public final class GlComputeRunner {
         for (int i = 0; i < 64; i++) {
             invoke(glUniform4fv, spPermU + i, 1, permUSeg.asSlice((long) i * 16, 16));
         }
+        permInstId = inst.id;
+    }
+
+    /** 一批：一次 draw 算 count 列 × 全部 y 层（y 超过 128 层时按片多次 draw），返回 [c*layers + yl]。 */
+    private float[] runRegionPass(ShadowShared.Instance inst, double baseX, double baseZ,
+                                  int count, int ySlices) {
+        int layers = Math.max(1, inst.layers);
+        invoke(glUseProgram, shadowProg);
+        invoke(glBindVertexArray, vao);
+
+        uploadPerms(inst);
         invoke(glUniform1i, spFreq, 128);
-        float[] sX = ddSplit(blockX);
-        float[] sZ = ddSplit(blockZ);
-        invoke(glUniform2f, spX0, sX[0], sX[1]);
-        invoke(glUniform2f, spY0, sZ[0], sZ[1]);
-        if (spOffX >= 0) invoke(glUniform1f, spOffX, (float) ShadowShared.realOx);
-        if (spOffY >= 0) invoke(glUniform1f, spOffY, (float) ShadowShared.realOy);   // uOffY = offsetY
-        if (spOffZ >= 0) invoke(glUniform1f, spOffZ, (float) ShadowShared.realOz);
-        if (spMinY >= 0) invoke(glUniform1f, spMinY, (float) ShadowShared.MIN_Y);    // uMinY = 柱起始高度
+        invoke(glUniform1i, spTestMode, 22);
+        // offset 折进基坐标（double 精度），shader 内不再加 offset —— 与 MC 的 double offset 一致
+        float[] sx = ddSplit(baseX + inst.ox);
+        invoke(glUniform2f, spX0, sx[0], sx[1]);
+        float[] sz = ddSplit(baseZ + inst.oz);
+        invoke(glUniform2f, spY0, sz[0], sz[1]);
+        float[] sdx = ddSplit(inst.dx);
+        float[] sdy = ddSplit(inst.dy);
+        if (spDx >= 0) invoke(glUniform2f, spDx, sdx[0], sdx[1]);
+        if (spDy >= 0) invoke(glUniform2f, spDy, sdy[0], sdy[1]);
+
         invoke(glBindFramebuffer, GL_FRAMEBUFFER, fbo);
         invoke(glViewport, 0, 0, size, size);
-        float[] cols = new float[256 * 384];
-        for (int cs = 0; cs < 2; cs++) {
-            for (int ys = 0; ys < 3; ys++) {
-                invoke(glUniform1i, spTestMode, 21);
-                invoke(glUniform1i, spColSlice, cs);
-                invoke(glUniform1i, spYSlice, ys);
-                prepDraw();
-                invoke(glDrawArrays, GL_TRIANGLES, 0, 3);
-                invoke(glFinish);
-                float[] out = readFbo(size * size);
-                for (int py = 0; py < 128; py++) {
-                    for (int pxx = 0; pxx < 128; pxx++) {
-                        int col = cs * 128 + pxx;
-                        int yl = ys * 128 + py;
-                        cols[col * 384 + yl] = out[(py * 128 + pxx) * 4];
-                    }
+        float[] out = new float[count * layers];
+        for (int ys = 0; ys < ySlices; ys++) {
+            int yBase = ys * size;
+            if (yBase >= layers) break;
+            double by = inst.by + (double) yBase * inst.dy + inst.oy;
+            float[] sy = ddSplit(by);
+            if (spGY0 >= 0) invoke(glUniform2f, spGY0, sy[0], sy[1]);
+            prepDraw();
+            invoke(glDrawArrays, GL_TRIANGLES, 0, 3);
+            invoke(glFinish);
+            int yn = Math.min(size, layers - yBase);
+            // v0.11.0: 只回读实际用到的 count x yn 子矩形（旧版整屏 16384 像素白白多读 8 倍）
+            float[] px = readFboRect(count, yn);
+            for (int yl = 0; yl < yn; yl++) {
+                int rowBase = yl * count;
+                for (int c = 0; c < count; c++) {
+                    int idx = (rowBase + c) * 4;
+                    // 真实值 = hi + lo（dd 两段合成），以 double 相加再收成 float，避免二次舍入
+                    out[c * layers + yBase + yl] = (float) ((double) px[idx] + (double) px[idx + 1]);
                 }
             }
         }
         invoke(glBindFramebuffer, GL_FRAMEBUFFER, 0);
-        return cols;
+        return out;
     }
 
-    /** v0.10.0: 渲染线程每 tick：从 pending 取 1 区块 GPU 预生成，抽检比对 CPU 参考（<1e-5）通过才写柱缓存。 */
-    private void pregenTick() {
-        if (ShadowShared.pending.isEmpty()) return;
-        ensureShadowProg();
-        if (shadowProg < 0) return;                 // 编译失败，下轮重试（MobileGlues 非确定）
-        if (++pregenTickCount % 2 != 0) return;     // 每 2 tick 处理 1 区块，避免占帧过多
-        Long ck = ShadowShared.pending.keySet().iterator().next();
-        if (ck == null) return;
-        ShadowShared.pending.remove(ck);
-        int blockX = (int) (ck >> 32);
-        int blockZ = (int) (ck.longValue());
-        saveState();
-        try {
-            long t0 = System.nanoTime();
-            float[] cols = runMcColumns(blockX, blockZ);
-            // 抽检：每柱 24 层（yl 步长 16），CPU 参考用与 GPU 一致的 float 化 offsets
-            CpuMcPerlin cpu = new CpuMcPerlin(ShadowShared.realPerms,
-                    (double) (float) ShadowShared.realOx,
-                    (double) (float) ShadowShared.realOy,
-                    (double) (float) ShadowShared.realOz);
-            int failedCols = 0;
-            boolean[] ok = new boolean[256];
-            for (int col = 0; col < 256; col++) {
-                int cx = col % 16, cz = col / 16;
-                double wx = blockX + cx, wz = blockZ + cz;
-                boolean colOk = true;
-                for (int yl = 0; yl < 384 && colOk; yl += 16) {
-                    double ref = cpu.get3(wx, ShadowShared.MIN_Y + yl, wz);
-                    double gpuV = cols[col * 384 + yl];
-                    if (Math.abs(gpuV - ref) > 1e-5) colOk = false;
-                }
-                ok[col] = colOk;
-                if (!colOk) failedCols++;
-            }
-            if (failedCols < 256) {                 // 至少 1 柱通过才写；全失败 = GPU 整体异常（不写 → 全 CPU fallback）
-                float[] colData = new float[384];
-                for (int col = 0; col < 256; col++) {
-                    if (!ok[col]) continue;         // 失败柱不写 → mixin miss → CPU fallback
-                    System.arraycopy(cols, col * 384, colData, 0, 384);
-                    ShadowShared.columns.put(ShadowShared.colKey(blockX + col % 16, blockZ + col / 16), colData.clone());
-                }
-                ShadowShared.columnsPregen.incrementAndGet();
-                if (failedCols > 0) ShadowShared.columnsFailed.addAndGet(failedCols);
-            }
-            pregenNanos += System.nanoTime() - t0;
-            long total = ShadowShared.gpuHits.get() + ShadowShared.gpuMisses.get();
-            if (ShadowShared.columnsPregen.get() % 8 == 1 || failedCols > 0) {
-                System.out.println(String.format("[GPUWorldGen] GPU 接管: 提供噪声 %.1f%% (%d hit / %d 总调用) | 预生成区块=%d 失败柱=%d 队列=%d | 平均=%.1fms/区块",
-                        100.0 * ShadowShared.gpuHits.get() / Math.max(1, total),
-                        ShadowShared.gpuHits.get(), total,
-                        ShadowShared.columnsPregen.get(), ShadowShared.columnsFailed.get(),
-                        ShadowShared.pending.size(),
-                        (double) pregenNanos / Math.max(1, ShadowShared.columnsPregen.get()) / 1e6));
-            }
-        } finally {
-            restoreState();
+    /** v0.11.0: 接管统计行（每 40 tick 一次 + 自检结束时一次）。 */
+    private void printStats(boolean force) {
+        long hit = ShadowShared.totalHits();
+        long miss = ShadowShared.totalMisses();
+        long calls = hit + miss;
+        double rate = calls > 0 ? 100.0 * hit / calls : 0.0;
+        int reg = ShadowShared.registered();
+        int served = ShadowShared.servedCount();
+        System.out.println(String.format(
+                "[GPUWorldGen] GPU 接管 v0.11: 提供噪声 %.2f%% (%d hit / %d 调用, 格点外 %d)"
+                        + " | 实例 %d 注册 / %d 可服务 | 缓存柱=%d | 预取 %d 批 / 失败 %d 批",
+                rate, hit, calls, ShadowShared.offLattice.get(), reg, served,
+                ShadowShared.totalColumns(), servicePasses, ShadowShared.totalFailPasses()));
+        if (servicePasses > 0) {
+            System.out.println(String.format(
+                    "[GPUWorldGen] 区域预取耗时: 均 %.2f ms/批 (draw+read+抽检), 均 %.1f 柱/批",
+                    (double) serviceNanos / servicePasses / 1e6,
+                    (double) ShadowShared.totalColumns() / servicePasses));
+        }
+        for (int i = 1; i <= 32; i++) {
+            ShadowShared.Instance inst = ShadowShared.get(i);
+            if (inst == null) continue;
+            if (inst.learnNote.isEmpty()) continue;
+            System.out.println(String.format(
+                    "[GPUWorldGen]   实例#%d: %s | 格点 x=%s/%s y=%s/%s(%d层) z=%s/%s | hit=%d miss=%d 越界=%d 格点外=%d 缓存柱=%d",
+                    inst.id, inst.ok ? "可服务" : "未接管(" + inst.learnNote + ")",
+                    ShadowShared.fmt(inst.bx), ShadowShared.fmt(inst.dx),
+                    ShadowShared.fmt(inst.by), ShadowShared.fmt(inst.dy), inst.layers,
+                    ShadowShared.fmt(inst.bz), ShadowShared.fmt(inst.dz),
+                    inst.hits, inst.misses, inst.oob, inst.offGrid, inst.cols.size()));
         }
     }
 
@@ -1065,6 +1206,9 @@ public final class GlComputeRunner {
             String ren = getString(glGetString, GL_RENDERER);
             report.append("    [GL] GL_VERSION: ").append(ver).append('\n');
             report.append("    [GL] GL_RENDERER: ").append(ren).append('\n');
+
+            // ---- v0.11.0: 回读复用缓冲（glReadPixels 目标，整屏 128x128 RGBA float） ----
+            ioBuf = arena.allocate((long) size * size * 16L);
 
             // ---- 输出纹理 texOut: 128x128 RGBA32F（FBO 颜色附件） ----
             MemorySegment texIds = arena.allocate(4);
@@ -1295,8 +1439,24 @@ public final class GlComputeRunner {
     }
 
     /** 从 FBO 读回 RGBA float（每像素 4 float：R=hi/探针A, G=lo/探针B, B=xf, A=yf） */
+    /** v0.11.0: 只回读 w x h 子矩形（像素按行优先，RGBA float）。 */
+    private float[] readFboRect(int w, int h) {
+        int n = w * h;
+        MemorySegment buf = ioBuf;   // v0.11.0: 复用缓冲区
+        invoke(glReadPixels, 0, 0, w, h, GL_RGBA, GL_FLOAT, buf);
+        float[] out = new float[n * 4];
+        for (int i = 0; i < n; i++) {
+            long off = (long) i * 16;
+            out[i * 4] = buf.get(ValueLayout.JAVA_FLOAT, off);
+            out[i * 4 + 1] = buf.get(ValueLayout.JAVA_FLOAT, off + 4);
+            out[i * 4 + 2] = buf.get(ValueLayout.JAVA_FLOAT, off + 8);
+            out[i * 4 + 3] = buf.get(ValueLayout.JAVA_FLOAT, off + 12);
+        }
+        return out;
+    }
+
     private float[] readFbo(int n) {
-        MemorySegment buf = arena.allocate((long) n * 4 * 4); // 128*128 RGBA float
+        MemorySegment buf = ioBuf;   // v0.11.0: 复用缓冲区，避免每批 arena.allocate 泄漏
         invoke(glReadPixels, 0, 0, size, size, GL_RGBA, GL_FLOAT, buf);
         float[] out = new float[n * 4];
         for (int i = 0; i < n; i++) {
