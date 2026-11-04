@@ -3,13 +3,13 @@
   "id": "${mod_id}",
   "version": "${version}",
   "name": "${mod_name}",
-  "description": "Mobile GPU world generation adapter for Minecraft Java Edition. Uses Java FFM to drive GLES (MobileGlues) fragment shaders on Adreno GPUs, replicating MC PerlinNoise with double-double precision (<1e-6), verified in shadow mode against the real world generator.",
+  "description": "M1B-GPUWorldGen — mobile GPU world generation adapter for Minecraft Java Edition. Uses Java FFM to drive GLES (MobileGlues) fragment shaders on Adreno GPUs, replicating MC PerlinNoise with double-double precision (<1e-6), verified against the real world generator.",
   "authors": [
     "ZQ-斩情"
   ],
   "contact": {},
   "license": "MIT",
-  "icon": "assets/c2me-gpuworldgen/icon.png",
+  "icon": "assets/m1b-gpuworldgen/icon.png",
   "environment": "client",
   "entrypoints": {
     "client": [

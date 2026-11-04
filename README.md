@@ -1,4 +1,4 @@
-# M¹B-GPUWorldGen
+# M1B-GPUWorldGen
 
 为 **Minecraft Java 版（手机端）** 实现真正 GPU 加速世界生成的 Fabric 适配 mod。
 

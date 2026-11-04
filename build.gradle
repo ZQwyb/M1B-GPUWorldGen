@@ -46,7 +46,7 @@ java {
 }
 
 base {
-	// 交付产物名固定为 c2me-gpuworldgen-<version>.jar（避免用中文项目目录名当 jar 名）
+	// 交付产物名固定为 m1b-gpuworldgen-<version>.jar（避免用中文项目目录名当 jar 名）
 	archivesName = project.archives_base_name
 }
 
