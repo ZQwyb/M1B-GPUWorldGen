@@ -262,7 +262,10 @@ public final class ShadowShared {
             if (learned) return;
             // 先按观测到的最小/最大坐标裁掉明显离群的极值（混合尺度时 min/max 可能跨层）
             double stepX = strideOf(svX, nX, minX, maxX);
-            double stepY = strideOf(svY, nY, minY, maxY);
+            // y 恒定 = 2D 噪声（MC 的 get(DD) 走 get(wrap(x),0,wrap(z))）：可当单层柱服务，
+            // 步长取 1、层数 1，lookup 里 (y-by) 必须命中唯一一层。
+            boolean flat = (nY < 2) || (maxY - minY <= 1e-12);
+            double stepY = flat ? 1.0 : strideOf(svY, nY, minY, maxY);
             double stepZ = strideOf(svZ, nZ, minZ, maxZ);
             if (!(stepX > 0) || !(stepY > 0) || !(stepZ > 0)) {
                 learned = true;
@@ -272,7 +275,7 @@ public final class ShadowShared {
                 logLearn();
                 return;
             }
-            int nLayers = (int) Math.round((maxY - minY) / stepY) + 1;
+            int nLayers = flat ? 1 : (int) Math.round((maxY - minY) / stepY) + 1;
             if (nLayers < 1) nLayers = 1;
             if (nLayers > 4096) nLayers = 4096;
 
@@ -413,6 +416,11 @@ public final class ShadowShared {
             }
             return out;
         }
+    }
+
+    /** 注册表容量（mixin 日志用） */
+    public static int maxRegister() {
+        return MAX_REG;
     }
 
     public static int registered() {

@@ -873,7 +873,10 @@ public final class GlComputeRunner {
         }
         if (shadowProg < 0) {
             if (progBackoff > 0) { progBackoff--; return; }
-            ensureShadowProg();
+            // 编译/自检也会改 GL 状态（FBO/viewport/clearColor），必须一起包进 save/restore，
+            // 否则会像 v0.8.5 那样把当帧 GUI 画花。
+            saveState();
+            try { ensureShadowProg(); } finally { restoreState(); }
             if (shadowProg < 0) { progBackoff = 40; return; }
         }
         int budget = Math.max(1, cfg.prefetchPassesPerTick);

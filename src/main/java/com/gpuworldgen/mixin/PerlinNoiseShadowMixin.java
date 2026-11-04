@@ -71,6 +71,15 @@ public abstract class PerlinNoiseShadowMixin {
      * 注册本实例并返回 id（0=不可用）。
      * 首个注册的实例同时作为 2D 影子对拍的参考实例。
      */
+    /** 只注册一次（并发首个调用可能来自多个区块线程，必须互斥，否则同一实例会占两个 id） */
+    private synchronized int gpuworldgen$registerOnce() {
+        int cur = gpuworldgen$id;
+        if (cur != 0) return cur;
+        int id = gpuworldgen$register();
+        gpuworldgen$id = id;
+        return id;
+    }
+
     private int gpuworldgen$register() {
         ensureFields();
         if (!fieldsReady) return -1;
@@ -85,7 +94,7 @@ public abstract class PerlinNoiseShadowMixin {
             }
             int id = ShadowShared.register(this, perms, ox, oy, oz);
             if (id == 0) {
-                System.out.println("[GPUWorldGen][mixin] 实例注册超限（>32），本实例永久 CPU fallback");
+                System.out.println("[GPUWorldGen][mixin] 实例注册超限（>" + ShadowShared.maxRegister() + "），本实例永久 CPU fallback");
                 return -1;
             }
             System.out.println("[GPUWorldGen][mixin] 注册 PerlinNoise 实例 #" + id
@@ -121,8 +130,7 @@ public abstract class PerlinNoiseShadowMixin {
                     diag3d = true;
                     System.out.println("[GPUWorldGen][mixin] 已命中 get(DDD)F，首次调用 (x=" + x + " y=" + y + " z=" + z + ")");
                 }
-                id = gpuworldgen$register();
-                gpuworldgen$id = id;
+                id = gpuworldgen$registerOnce();
                 if (id <= 0) return;
             }
             if (id < 0) return;
