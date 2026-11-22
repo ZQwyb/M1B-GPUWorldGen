@@ -1,6 +1,6 @@
 # M1B-GPUWorldGen
 
-赞助支持：https://afdian.net/a/zq1627
+赞助支持：https://afdian.com/a/zq1627
 抖音：斩情-我的世界，分享MC模组开发、整合包与M1B-GPUWorldGen项目进度
 
 **在手机的 GPU 上跑 Minecraft Java 版的世界生成噪声。**
