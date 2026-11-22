@@ -1,5 +1,8 @@
 # M1B-GPUWorldGen
 
+赞助支持：https://afdian.net/a/zq1627
+抖音：斩情-我的世界｜分享MC整合包与开发进度
+
 **在手机的 GPU 上跑 Minecraft Java 版的世界生成噪声。**
 面向没有 PC 的玩家（PojavLauncher / Zalith Launcher / MobileGlues），把 `PerlinNoise`
 的计算下沉到 Adreno GPU，并保证与原版 **逐点一致（误差 < 1e-6）**。
