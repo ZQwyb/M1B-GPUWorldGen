@@ -1,11 +1,12 @@
-# M1B-GPUWorldGen
-
-本仓库用于发布、维护我的世界整合包与相关模组，包含模组源码、配置文件、优化方案。
+# 📦 M1B-GPUWorldGen
+本仓库用于我的世界模组开发，配套抖音发布整合包。
 
 💖 支持我：
 爱发电主页：https://afdian.com/a/zq1627
 
-同步更新平台：抖音（整合包发布）https://v.douyin.com/7wF7vejkMlE/
+抖音（整合包发布）：https://v.douyin.com/7wF7vejkMlE/
+持续更新模组、适配、修复BUG
+
 
 **在手机的 GPU 上跑 Minecraft Java 版的世界生成噪声。**
 面向没有 PC 的玩家（PojavLauncher / Zalith Launcher / MobileGlues），把 `PerlinNoise`
